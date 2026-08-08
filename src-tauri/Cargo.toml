@@ -26,6 +26,7 @@ windows = { version = "0.58", features = ["Win32_System_SystemInformation", "Win
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.9"
+core-foundation-sys = "0.8"
 io-kit-sys = "0.4"
 
 [features]

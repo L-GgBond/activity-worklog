@@ -36,7 +36,11 @@ fn platform_idle_duration() -> anyhow::Result<Duration> {
     use core_foundation::dictionary::CFDictionary;
     use core_foundation::number::CFNumber;
     use core_foundation::string::CFString;
-    use io_kit_sys::IOKitLib::{IOObjectRelease, IORegistryEntryCreateCFProperties, IOServiceGetMatchingService, IOServiceMatching};
+    use core_foundation_sys::dictionary::CFMutableDictionaryRef;
+    use io_kit_sys::{
+        IOObjectRelease, IORegistryEntryCreateCFProperties, IOServiceGetMatchingService,
+        IOServiceMatching,
+    };
     use std::ffi::CString;
 
     unsafe {
@@ -46,7 +50,7 @@ fn platform_idle_duration() -> anyhow::Result<Duration> {
             anyhow::bail!("IOHIDSystem service not found");
         }
 
-        let mut properties = std::ptr::null();
+        let mut properties: CFMutableDictionaryRef = std::ptr::null_mut();
         let result = IORegistryEntryCreateCFProperties(service, &mut properties, std::ptr::null(), 0);
         IOObjectRelease(service);
         if result != 0 || properties.is_null() {
