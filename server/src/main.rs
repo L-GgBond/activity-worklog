@@ -1,0 +1,396 @@
+use std::fs;
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::Html;
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use chrono::{Datelike, Local, NaiveDate};
+use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
+use tower_http::cors::CorsLayer;
+
+struct AppState {
+    conn: Mutex<Connection>,
+    token: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DailyRecordDto {
+    date: String,
+    first_activity_at: Option<String>,
+    last_activity_at: Option<String>,
+    active_minutes: i64,
+    idle_minutes: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct SyncPayload {
+    #[serde(default)]
+    device_id: String,
+    records: Vec<DailyRecordDto>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ReportRow {
+    period: String,
+    days: i64,
+    active_minutes: i64,
+    idle_minutes: i64,
+    first_activity_at: Option<String>,
+    last_activity_at: Option<String>,
+}
+
+fn data_dir() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("activity-worklog-server")
+}
+
+fn open_db() -> anyhow::Result<Connection> {
+    let dir = data_dir();
+    fs::create_dir_all(&dir)?;
+    let conn = Connection::open(dir.join("server.sqlite3"))?;
+    conn.execute_batch(
+        "
+        create table if not exists synced_records (
+            date text primary key,
+            first_activity_at text,
+            last_activity_at text,
+            active_minutes integer not null default 0,
+            idle_minutes integer not null default 0,
+            device_id text not null default '',
+            received_at text not null
+        );
+        ",
+    )?;
+    Ok(conn)
+}
+
+fn load_or_create_token() -> anyhow::Result<String> {
+    let dir = data_dir();
+    fs::create_dir_all(&dir)?;
+    let token_path = dir.join("server-token.txt");
+    if let Ok(existing) = fs::read_to_string(&token_path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    let token = generate_token()?;
+    fs::write(&token_path, &token)?;
+    Ok(token)
+}
+
+fn generate_token() -> anyhow::Result<String> {
+    // 优先从系统随机源取 16 字节，失败时回退到时间+进程哈希
+    if let Ok(mut file) = fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        let mut buf = [0u8; 16];
+        if file.read_exact(&mut buf).is_ok() {
+            return Ok(buf.iter().map(|byte| format!("{byte:02x}")).collect());
+        }
+    }
+    let now = Local::now();
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in now.to_rfc3339().bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Ok(format!("tok-{hash:016x}"))
+}
+
+fn authorize(headers: &HeaderMap, token: &str) -> Result<(), StatusCode> {
+    let value = headers
+        .get("authorization")
+        .and_then(|header| header.to_str().ok())
+        .unwrap_or_default();
+    let provided = value.strip_prefix("Bearer ").unwrap_or(value).trim();
+    if !provided.is_empty() && provided == token {
+        Ok(())
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+async fn health(State(state): State<AppState>, headers: HeaderMap) -> Result<String, StatusCode> {
+    authorize(&headers, &state.token)?;
+    Ok("ok".to_string())
+}
+
+async fn sync_records(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<SyncPayload>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    authorize(&headers, &state.token)?;
+    let conn = state.conn.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let received_at = Local::now().to_rfc3339();
+    let mut accepted = 0usize;
+    for record in &payload.records {
+        if NaiveDate::parse_from_str(&record.date, "%Y-%m-%d").is_err() {
+            continue;
+        }
+        conn.execute(
+            "
+            insert into synced_records
+                (date, first_activity_at, last_activity_at, active_minutes, idle_minutes, device_id, received_at)
+            values (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            on conflict(date) do update set
+                first_activity_at = excluded.first_activity_at,
+                last_activity_at = excluded.last_activity_at,
+                active_minutes = excluded.active_minutes,
+                idle_minutes = excluded.idle_minutes,
+                device_id = excluded.device_id,
+                received_at = excluded.received_at
+            ",
+            params![
+                record.date,
+                record.first_activity_at,
+                record.last_activity_at,
+                record.active_minutes,
+                record.idle_minutes,
+                payload.device_id,
+                received_at
+            ],
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        accepted += 1;
+    }
+    Ok(Json(serde_json::json!({ "accepted": accepted })))
+}
+
+fn query_rows(
+    conn: &Connection,
+    where_clause: &str,
+) -> Result<Vec<(String, Option<String>, Option<String>, i64, i64), StatusCode> {
+    let sql = format!(
+        "
+        select date, first_activity_at, last_activity_at, active_minutes, idle_minutes
+        from synced_records
+        where {where_clause}
+        order by date desc
+        "
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn date_n_days_ago(days: i64) -> String {
+    (Local::now().date_naive() - chrono::Duration::days(days)).format("%Y-%m-%d").to_string()
+}
+
+#[derive(Debug, Deserialize)]
+struct RangeQuery {
+    days: Option<i64>,
+    weeks: Option<i64>,
+    months: Option<i64>,
+}
+
+async fn daily_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<RangeQuery>,
+) -> Result<Json<Vec<ReportRow>>, StatusCode> {
+    authorize(&headers, &state.token)?;
+    let days = query.days.unwrap_or(30).clamp(1, 366);
+    let since = date_n_days_ago(days - 1);
+    let conn = state.conn.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rows = query_rows(&conn, &format!("date >= '{since}'"))?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|(date, first, last, active, idle)| ReportRow {
+                period: date,
+                days: 1,
+                active_minutes: active,
+                idle_minutes: idle,
+                first_activity_at: first,
+                last_activity_at: last,
+            })
+            .collect(),
+    ))
+}
+
+async fn weekly_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<RangeQuery>,
+) -> Result<Json<Vec<ReportRow>>, StatusCode> {
+    authorize(&headers, &state.token)?;
+    let weeks = query.weeks.unwrap_or(8).clamp(1, 52);
+    let since = date_n_days_ago(weeks * 7);
+    let conn = state.conn.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rows = query_rows(&conn, &format!("date >= '{since}'"))?;
+    Ok(Json(aggregate_by_period(rows, |date| iso_week_key(date))))
+}
+
+async fn monthly_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<RangeQuery>,
+) -> Result<Json<Vec<ReportRow>>, StatusCode> {
+    authorize(&headers, &state.token)?;
+    let months = query.months.unwrap_or(12).clamp(1, 36);
+    let since = date_n_days_ago(months * 31);
+    let conn = state.conn.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rows = query_rows(&conn, &format!("date >= '{since}'"))?;
+    Ok(Json(aggregate_by_period(rows, |date| date[..7].to_string())))
+}
+
+fn iso_week_key(date: &str) -> String {
+    NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .map(|parsed| {
+            let week = parsed.iso_week().week();
+            format!("{}-W{week:02}", parsed.iso_week().year())
+        })
+        .unwrap_or_else(|_| date.to_string())
+}
+
+fn aggregate_by_period(
+    rows: Vec<(String, Option<String>, Option<String>, i64, i64)>,
+    key_of: impl Fn(&str) -> String,
+) -> Vec<ReportRow> {
+    use std::collections::BTreeMap;
+    let mut grouped: BTreeMap<String, ReportRow> = BTreeMap::new();
+    for (date, first, last, active, idle) in rows {
+        let key = key_of(&date);
+        let entry = grouped.entry(key.clone()).or_insert_with(|| ReportRow {
+            period: key,
+            days: 0,
+            active_minutes: 0,
+            idle_minutes: 0,
+            first_activity_at: None,
+            last_activity_at: None,
+        });
+        entry.days += 1;
+        entry.active_minutes += active;
+        entry.idle_minutes += idle;
+        // 周/月的首次活动取组内最早，最后活动取组内最晚
+        entry.first_activity_at = match (&entry.first_activity_at, &first) {
+            (_, None) => entry.first_activity_at.clone(),
+            (None, Some(value)) => Some(value.clone()),
+            (Some(current), Some(value)) => Some(current.min(value).clone()),
+        };
+        entry.last_activity_at = match (&entry.last_activity_at, &last) {
+            (_, None) => entry.last_activity_at.clone(),
+            (None, Some(value)) => Some(value.clone()),
+            (Some(current), Some(value)) => Some(current.max(value).clone()),
+        };
+    }
+    grouped.into_values().rev().collect()
+}
+
+async fn dashboard() -> Html<&'static str> {
+    Html(DASHBOARD_HTML)
+}
+
+const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Activity Worklog 报表</title>
+<style>
+  :root { color: #202124; background: #f5f6f4; font-family: Inter, "Segoe UI", "Microsoft YaHei", sans-serif; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 28px; max-width: 960px; margin-inline: auto; }
+  h1 { margin: 0 0 4px; }
+  p.sub { color: #68736f; margin: 0 0 20px; }
+  .bar { display: flex; gap: 10px; align-items: center; margin-bottom: 20px; flex-wrap: wrap; }
+  input { min-height: 40px; padding: 0 12px; border: 1px solid #dfe6e1; border-radius: 8px; background: #fff; font: inherit; flex: 1; }
+  button { border: 0; cursor: pointer; min-height: 40px; padding: 0 16px; border-radius: 8px; color: #fff; background: #2c7d57; font: inherit; }
+  section { border: 1px solid #dfe6e1; border-radius: 8px; background: #fff; margin-bottom: 18px; overflow: hidden; }
+  section h2 { margin: 0; padding: 14px 18px; border-bottom: 1px solid #e6ece8; font-size: 1.05rem; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 10px 18px; border-bottom: 1px solid #eef2ef; }
+  th { color: #68736f; font-weight: 500; background: #f8faf8; }
+  .msg { color: #b3261e; }
+</style>
+</head>
+<body>
+<h1>Activity Worklog 报表</h1>
+<p class="sub">日报 / 周报 / 月报（数据来自客户端同步上传）</p>
+<div class="bar">
+  <input id="token" type="password" placeholder="访问 Token（见服务器控制台输出）" />
+  <button onclick="load()">刷新</button>
+</div>
+<p id="msg" class="msg"></p>
+<section><h2>日报（近 14 天）</h2><table id="daily"></table></section>
+<section><h2>周报（近 8 周）</h2><table id="weekly"></table></section>
+<section><h2>月报（近 12 个月）</h2><table id="monthly"></table></section>
+<script>
+function fmt(mins) {
+  const h = Math.floor(mins / 60), m = mins % 60;
+  return h + "小时" + String(m).padStart(2, "0") + "分";
+}
+async function fetchReport(path) {
+  const token = document.getElementById("token").value.trim();
+  const res = await fetch(path, { headers: { "Authorization": "Bearer " + token } });
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  return res.json();
+}
+function render(tableId, rows) {
+  const head = "<tr><th>周期</th><th>天数</th><th>活跃时长</th><th>空闲时长</th><th>首次活动</th><th>最后活动</th></tr>";
+  const body = rows.map(r =>
+    "<tr><td>" + r.period + "</td><td>" + r.days + "</td><td>" + fmt(r.active_minutes) +
+    "</td><td>" + fmt(r.idle_minutes) + "</td><td>" + (r.first_activity_at ?? "--:--") +
+    "</td><td>" + (r.last_activity_at ?? "--:--") + "</td></tr>"
+  ).join("");
+  document.getElementById(tableId).innerHTML = head + (body || "<tr><td colspan='6'>暂无数据</td></tr>");
+}
+async function load() {
+  const msg = document.getElementById("msg");
+  msg.textContent = "";
+  try {
+    render("daily", await fetchReport("/api/reports/daily?days=14"));
+    render("weekly", await fetchReport("/api/reports/weekly?weeks=8"));
+    render("monthly", await fetchReport("/api/reports/monthly?months=12"));
+  } catch (err) {
+    msg.textContent = "加载失败：" + err.message + "（请确认 Token 是否正确）";
+  }
+}
+</script>
+</body>
+</html>
+"#;
+
+#[tokio::main]
+async fn main() {
+    let conn = open_db().expect("打开数据库失败");
+    let token = load_or_create_token().expect("生成 Token 失败");
+
+    println!("Activity Worklog 报表服务已启动：http://127.0.0.1:8787");
+    println!("访问 Token：{token}");
+    println!("（Token 保存在 {}，客户端“数据同步”页需填入同一 Token）", data_dir().join("server-token.txt").display());
+
+    let app = Router::new()
+        .route("/", get(dashboard))
+        .route("/api/health", get(health))
+        .route("/api/sync/records", post(sync_records))
+        .route("/api/reports/daily", get(daily_report))
+        .route("/api/reports/weekly", get(weekly_report))
+        .route("/api/reports/monthly", get(monthly_report))
+        .layer(CorsLayer::permissive())
+        .with_state(std::sync::Arc::new(AppState {
+            conn: Mutex::new(conn),
+            token,
+        }));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:8787")
+        .await
+        .expect("端口 8787 被占用");
+    axum::serve(listener, app).await.expect("服务启动失败");
+}

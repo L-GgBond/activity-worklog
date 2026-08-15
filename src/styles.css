@@ -215,7 +215,7 @@ h2 {
 
 .settings {
   display: grid;
-  grid-template-columns: 2fr 1fr 1fr;
+  grid-template-columns: 2fr 1fr;
   gap: 18px;
   align-items: center;
   margin-top: 18px;
@@ -246,6 +246,204 @@ input[type="range"] {
   width: 20px;
   height: 20px;
   accent-color: #2c7d57;
+}
+
+.timeline {
+  padding: 18px;
+}
+
+.timelineBar {
+  position: relative;
+  height: 26px;
+  margin-bottom: 14px;
+  border-radius: 8px;
+  background: #f0f4f1;
+  overflow: hidden;
+}
+
+.timelineFill {
+  position: absolute;
+  top: 0;
+  height: 100%;
+}
+
+.timelineFill.work,
+.timelineBar .timelineFill {
+  background: #91d6ac;
+}
+
+.timelineBar.away .timelineFill {
+  background: #f6c37c;
+}
+
+.timelineLabels {
+  display: flex;
+  justify-content: space-between;
+  color: #68736f;
+  font-size: 0.8rem;
+  margin-bottom: 12px;
+}
+
+.segmentList {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.chip {
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 0.82rem;
+}
+
+.chip.work {
+  color: #1c6b49;
+  background: #dff6e7;
+}
+
+.chip.away {
+  color: #7a4b10;
+  background: #fff1d6;
+}
+
+.empty {
+  color: #68736f;
+  margin: 8px 0;
+}
+
+.form {
+  display: grid;
+  gap: 16px;
+  padding: 18px;
+  max-width: 560px;
+}
+
+.form label {
+  display: grid;
+  gap: 8px;
+}
+
+.form input[type="text"],
+.form input[type="password"],
+.form input[type="number"] {
+  min-height: 42px;
+  padding: 0 12px;
+  border: 1px solid #dfe6e1;
+  border-radius: 8px;
+  background: #fbfdfc;
+}
+
+.formActions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+button.primary {
+  border: 0;
+  cursor: pointer;
+  min-height: 40px;
+  padding: 0 18px;
+  border-radius: 8px;
+  color: #ffffff;
+  background: #2c7d57;
+}
+
+.syncResult {
+  color: #3d4743;
+  font-size: 0.9rem;
+}
+
+.privacyList {
+  margin: 0;
+  padding: 18px 18px 18px 38px;
+  display: grid;
+  gap: 10px;
+  color: #3d4743;
+}
+
+.wizard {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+  padding: 24px;
+}
+
+.wizardCard {
+  width: min(560px, 100%);
+  padding: 28px;
+  border: 1px solid #dfe6e1;
+  border-radius: 12px;
+  background: #ffffff;
+}
+
+.wizardCard .brand {
+  color: #202124;
+}
+
+.wizardCard .brand span {
+  color: #68736f;
+}
+
+.wizardSteps {
+  display: flex;
+  gap: 16px;
+  list-style: none;
+  padding: 0;
+  margin: 18px 0;
+}
+
+.wizardSteps li {
+  color: #98a29e;
+  font-size: 0.9rem;
+  padding-bottom: 6px;
+}
+
+.wizardSteps li.active {
+  color: #17201d;
+  font-weight: 600;
+  border-bottom: 2px solid #2c7d57;
+}
+
+.wizardSteps li.done {
+  color: #2c7d57;
+}
+
+.wizardBody h2 {
+  margin-bottom: 8px;
+}
+
+.hint {
+  color: #68736f;
+  font-size: 0.9rem;
+  margin: 4px 0 12px;
+}
+
+.wizardBody .form {
+  padding: 0;
+}
+
+.wizardActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  margin-top: 24px;
+}
+
+.wizardActions button {
+  border: 0;
+  cursor: pointer;
+  min-height: 40px;
+  padding: 0 18px;
+  border-radius: 8px;
+  background: #eef2ef;
+  color: #21302b;
+}
+
+.wizardActions button.primary {
+  color: #ffffff;
+  background: #2c7d57;
 }
 
 @media (max-width: 850px) {
