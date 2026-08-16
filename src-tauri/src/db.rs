@@ -27,6 +27,12 @@ pub struct ActivitySegment {
     pub segment_type: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct HourBucket {
+    pub hour: u32,
+    pub minutes: i64,
+}
+
 pub struct Store {
     conn: Connection,
     data_dir: PathBuf,
@@ -386,6 +392,45 @@ impl Store {
         }
         writer.flush()?;
         Ok(path)
+    }
+
+    /// 数据库文件路径（用于备份/恢复）。
+    pub fn db_path(&self) -> PathBuf {
+        self.data_dir.join("worklog.sqlite3")
+    }
+
+    /// 按小时聚合最近 range_days 天的工作（活跃）时长，返回 0..24 每个小时的分钟数。
+    pub fn hourly_activity(&self, range_days: u32) -> anyhow::Result<Vec<HourBucket>> {
+        let since = (Local::now() - chrono::Duration::days(range_days.saturating_sub(1) as i64))
+            .format("%Y-%m-%d")
+            .to_string();
+        let mut stmt = self.conn.prepare(
+            "select started_at, ended_at from activity_segments where segment_type = 'work' and date >= ?1",
+        )?;
+        let rows = stmt.query_map(params![since], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        let mut buckets = [0i64; 24];
+        for row in rows {
+            let (s, e) = row?;
+            let ss = parse_time_seconds(&s);
+            let ee = if e.is_empty() { ss } else { parse_time_seconds(&e) };
+            let (mut cur, ee) = (ss.min(ee), ss.max(ee));
+            while cur < ee {
+                let hour = (cur / 3600) as usize;
+                let end_of_hour = ((hour as i64 + 1) * 3600).min(ee);
+                buckets[hour] += end_of_hour - cur;
+                cur = end_of_hour;
+            }
+        }
+
+        Ok((0..24)
+            .map(|h| HourBucket {
+                hour: h,
+                minutes: buckets[h as usize] / 60,
+            })
+            .collect())
     }
 }
 

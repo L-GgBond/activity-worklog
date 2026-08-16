@@ -1,0 +1,61 @@
+name: Release
+
+# 触发：推送 v* 标签（如 v0.2.0），或手动在 Actions 页面运行。
+# 产物：构建 macOS 安装包 + 自动生成带 updater 签名的 latest.json / .app.tar.gz / .app.tar.gz.sig，
+#       并发布到 GitHub Releases（latest.json 地址需与 tauri.conf.json 的 endpoints 一致）。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos-latest]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install frontend dependencies
+        run: npm install
+
+      # tauri-action 会执行 tauri build：
+      #  - 配置了 updater 插件且设置了 TAURI_SIGNING_PRIVATE_KEY 时，
+      #    自动生成带签名的 latest.json / .app.tar.gz / .app.tar.gz.sig。
+      #  - 这些文件会被上传到 Release，updater 端点即可拉取校验。
+      - name: Build and release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 私钥内容（.tauri/activity-worklog.key 的全部文本），需在仓库 Secrets 中配置
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # 若生成密钥时设置了密码，则在此填写；无密码可留空或不配置
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: v__VERSION__
+          releaseName: "Activity Worklog v__VERSION__"
+          releaseBody: "自动构建的 macOS 安装包与更新资源。"
+          # 先作为草稿发布，确认无误后在 GitHub 页面手动 Publish（草稿状态下 /latest/download 不生效）
+          releaseDraft: true
+          prerelease: false
+          args: ""

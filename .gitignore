@@ -3,3 +3,10 @@ dist
 src-tauri/target
 .DS_Store
 *.log
+# updater 私钥（含签名密钥，严禁提交）
+.tauri/
+.env
+# 构建产物（DMG 由 CI/发布流程生成，不进 git 历史）
+*.dmg
+# WorkBuddy 本地记忆与项目数据（非源码）
+.workbuddy/

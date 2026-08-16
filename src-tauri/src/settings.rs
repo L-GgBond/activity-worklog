@@ -22,6 +22,20 @@ pub struct AppSettings {
     pub lunch_start: String,
     #[serde(default = "default_lunch_end")]
     pub lunch_end: String,
+    // 窗口尺寸记忆（0 表示未设置，使用默认）
+    #[serde(default)]
+    pub window_width: u32,
+    #[serde(default)]
+    pub window_height: u32,
+    // 外观主题：system / light / dark
+    #[serde(default = "default_theme")]
+    pub theme: String,
+    // 每日目标活跃时长（分钟），0 表示不设置目标
+    #[serde(default = "default_daily_target")]
+    pub daily_target_minutes: u32,
+    // 菜单栏驻留模式：隐藏 Dock 图标，仅菜单栏常驻
+    #[serde(default)]
+    pub menubar_only: bool,
 }
 
 fn default_work_start() -> String {
@@ -38,6 +52,14 @@ fn default_lunch_start() -> String {
 
 fn default_lunch_end() -> String {
     "13:30".into()
+}
+
+fn default_theme() -> String {
+    "system".into()
+}
+
+fn default_daily_target() -> u32 {
+    480
 }
 
 fn default_sync_interval() -> u32 {
@@ -58,6 +80,11 @@ impl Default for AppSettings {
             work_end: default_work_end(),
             lunch_start: default_lunch_start(),
             lunch_end: default_lunch_end(),
+            window_width: 0,
+            window_height: 0,
+            theme: default_theme(),
+            daily_target_minutes: default_daily_target(),
+            menubar_only: false,
         }
     }
 }
