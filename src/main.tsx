@@ -13,7 +13,7 @@ import {
   Moon,
   Power,
   RefreshCcw,
-  ShieldCheck,
+  SlidersHorizontal,
   TrendingUp
 } from "lucide-react";
 import { toBlob } from "html-to-image";
@@ -60,7 +60,7 @@ type Settings = {
   menubar_only: boolean;
 };
 
-type Page = "records" | "analytics" | "sync" | "privacy";
+type Page = "records" | "analytics" | "sync" | "settings";
 
 const defaultSettings: Settings = {
   idle_threshold_minutes: 5,
@@ -120,6 +120,11 @@ function App() {
   const [status, setStatus] = useState("正在读取本地记录");
   const [page, setPage] = useState<Page>("records");
   const [ready, setReady] = useState(false);
+  const [isPreview, setIsPreview] = useState(false);
+  const [saveFeedback, setSaveFeedback] = useState<{
+    state: "saving" | "saved" | "error" | "preview";
+    message: string;
+  } | null>(null);
   const [syncTestResult, setSyncTestResult] = useState("");
   const [appVersion, setAppVersion] = useState("");
   const [updateInfo, setUpdateInfo] = useState<{
@@ -136,6 +141,8 @@ function App() {
 
   const recordsRef = useRef(records);
   recordsRef.current = records;
+  const saveRequestRef = useRef(0);
+  const saveFeedbackTimerRef = useRef<number | null>(null);
 
   const [exportState, setExportState] = useState<"idle" | "exporting" | "done" | "error">("idle");
   const [exportPath, setExportPath] = useState("");
@@ -148,8 +155,9 @@ function App() {
   }, []);
 
 
-  const today = records[0] ?? fallbackRecords[0];
-  const todayStr = today.date;
+  const displayRecords = records.length ? records : isPreview ? fallbackRecords : [];
+  const today = displayRecords[0] ?? null;
+  const todayStr = today?.date ?? "";
 
   const syncState = syncTestResult
     ? syncTestResult.startsWith("连接成功")
@@ -165,11 +173,13 @@ function App() {
       ]);
       setRecords(loadedRecords);
       setSettings(loadedSettings);
+      setIsPreview(false);
       setStatus("后台监听已开启");
       return loadedSettings;
     } catch {
-      setRecords(fallbackRecords);
-      setSegments(fallbackSegments);
+      setRecords([]);
+      setSegments([]);
+      setIsPreview(true);
       setStatus("预览模式：运行 Tauri 后连接本地服务");
       return null;
     }
@@ -199,7 +209,12 @@ function App() {
   // 窗口尺寸记忆：启动恢复上次尺寸，拖动停止后保存
   useEffect(() => {
     if (!ready || !settings.onboarded) return;
-    const win = getCurrentWindow();
+    let win: ReturnType<typeof getCurrentWindow>;
+    try {
+      win = getCurrentWindow();
+    } catch {
+      return;
+    }
     const w = settingsRef.current.window_width;
     const h = settingsRef.current.window_height;
     if (w >= 960 && h >= 600) {
@@ -268,7 +283,12 @@ function App() {
           const win = getCurrentWindow();
           win.show().catch(() => {});
           win.setFocus().catch(() => {});
-          const t = recordsRef.current[0] ?? fallbackRecords[0];
+          const t = recordsRef.current[0];
+          if (!t) {
+            setPage("records");
+            setStatus("今日还没有活动记录");
+            return;
+          }
           const total = t.active_minutes + t.idle_minutes;
           const pct = total > 0 ? Math.round((t.active_minutes / total) * 100) : 0;
           setPage("records");
@@ -283,12 +303,29 @@ function App() {
 
   async function updateSettings(next: Partial<Settings>, silent = false) {
     const merged = { ...settingsRef.current, ...next };
+    const requestId = ++saveRequestRef.current;
     setSettings(merged);
+    if (!silent) {
+      if (saveFeedbackTimerRef.current) window.clearTimeout(saveFeedbackTimerRef.current);
+      setSaveFeedback({ state: "saving", message: "正在保存设置…" });
+    }
     try {
       await invoke("save_settings", { settings: merged });
-      if (!silent) setStatus("设置已保存");
+      if (!silent && requestId === saveRequestRef.current) {
+        setStatus("设置已保存");
+        setSaveFeedback({ state: "saved", message: "设置已保存" });
+        saveFeedbackTimerRef.current = window.setTimeout(() => setSaveFeedback(null), 2200);
+      }
     } catch {
-      if (!silent) setStatus("预览模式：设置将在桌面端保存");
+      if (!silent && requestId === saveRequestRef.current) {
+        const preview = isPreview;
+        setStatus(preview ? "预览模式：设置将在桌面端保存" : "设置保存失败，请重试");
+        setSaveFeedback({
+          state: preview ? "preview" : "error",
+          message: preview ? "预览模式下不会写入本地设置" : "保存失败，请重试"
+        });
+        saveFeedbackTimerRef.current = window.setTimeout(() => setSaveFeedback(null), 3200);
+      }
     }
     return merged;
   }
@@ -451,7 +488,7 @@ function App() {
   if (!ready) {
     return (
       <main className="shell">
-        <section className="workspace">加载中…</section>
+        <section className="workspace loading">加载中…</section>
       </main>
     );
   }
@@ -492,10 +529,10 @@ function App() {
             <Database size={18} />数据同步
           </button>
           <button
-            className={page === "privacy" ? "navActive" : ""}
-            onClick={() => setPage("privacy")}
+            className={page === "settings" ? "navActive" : ""}
+            onClick={() => setPage("settings")}
           >
-            <ShieldCheck size={18} />隐私设置
+            <SlidersHorizontal size={18} />设置
           </button>
         </nav>
         <div className="sidebarFoot">
@@ -512,7 +549,7 @@ function App() {
               {page === "records" && "自动统计上下班与工作时段"}
               {page === "analytics" && "数据统计与分析"}
               {page === "sync" && "数据同步设置"}
-              {page === "privacy" && "隐私与记录设置"}
+              {page === "settings" && "设置"}
             </h1>
           </div>
           {page === "records" && (
@@ -523,8 +560,27 @@ function App() {
           )}
         </header>
 
-        {page === "records" && (
+        {page === "records" && !today && (
+          <section className="panel firstRecordEmpty">
+            <div className="emptyIcon"><Activity size={26} /></div>
+            <h2>正在等待首次活动记录</h2>
+            <p>保持应用在后台运行，产生键盘或鼠标活动后，这里会自动显示今天的开始时间和工作时段。</p>
+            <div className="emptyActions">
+              <button className="primary" onClick={refresh}><RefreshCcw size={17} />重新检查</button>
+              <button onClick={() => setPage("settings")}><SlidersHorizontal size={17} />检查记录设置</button>
+            </div>
+          </section>
+        )}
+
+        {page === "records" && today && (
           <>
+            <div className="todayStatus">
+              <div>
+                <span className="statusDot" />
+                <strong>今日记录正常</strong>
+              </div>
+              <span>{isPreview ? "演示数据" : `最近活动 ${today.last_activity_at ?? "等待中"}`}</span>
+            </div>
             <section className="hero">
               <div className="heroRing">
                 <TodayRing active={today.active_minutes} idle={today.idle_minutes} />
@@ -579,9 +635,9 @@ function App() {
                     0
                   );
                   return (
-                    <div className={`timelineBar ${segment.segment_type}`} key={index}>
+                    <div className="timelineBar" key={index}>
                       <div
-                        className="timelineFill"
+                        className={`timelineFill ${segment.segment_type}`}
                         data-tip={`${segment.segment_type === "work" ? "工作" : "离开"} ${shortTime(
                           segment.started_at
                         )}–${shortTime(segment.ended_at)} · ${dur}分钟`}
@@ -631,7 +687,7 @@ function App() {
               <div className="panelTitle">
                 <div>
                   <h2>历史记录</h2>
-                  <p>共 {records.length || fallbackRecords.length} 天，本地保存，可按需同步数据库</p>
+                  <p>共 {displayRecords.length} 天，本地保存，可按需同步数据库</p>
                 </div>
               </div>
               <div className="table">
@@ -643,7 +699,7 @@ function App() {
                   <span>空闲</span>
                   <span>同步</span>
                 </div>
-                {(records.length ? records : fallbackRecords).map((record) => (
+                {displayRecords.map((record) => (
                   <div className="row" key={record.date}>
                     <span>{record.date}</span>
                     <span>{record.first_activity_at ?? "--:--"}</span>
@@ -660,7 +716,7 @@ function App() {
 
         {page === "analytics" && (
           <AnalyticsPage
-            records={records.length ? records : fallbackRecords}
+            records={displayRecords}
             settings={settings}
             reportRef={reportRef}
             onExport={handleExport}
@@ -728,52 +784,38 @@ function App() {
           </section>
         )}
 
-        {page === "privacy" && (
+        {page === "settings" && (
           <>
-            <section className="panel">
+            <section className="panel settingsPanel">
               <div className="panelTitle">
                 <div>
-                  <h2>隐私说明</h2>
-                  <p>本软件只判断“有没有操作”，不采集任何内容</p>
+                  <h2>常用设置</h2>
+                  <p>调整记录规则、外观和后台驻留方式</p>
                 </div>
               </div>
-              <ul className="privacyList">
-                <li>不读取具体按键，不保存键盘输入内容</li>
-                <li>不保存鼠标坐标，不截图，不读取用户文件</li>
-                <li>默认只保存活动时间、统计分钟数与同步状态</li>
-                <li>数据保存在本机，只有开启同步后才上传服务器</li>
-              </ul>
-            </section>
-            <section className="panel">
-              <div className="panelTitle">
-                <div>
-                  <h2>外观</h2>
-                  <p>跟随系统，或手动选择浅色 / 深色</p>
-                </div>
-              </div>
-              <div className="form">
-                <div className="tabs">
-                  {(["system", "light", "dark"] as const).map((t) => (
-                    <button
-                      key={t}
-                      className={settings.theme === t ? "tab active" : "tab"}
-                      onClick={() => updateSettings({ theme: t })}
-                    >
-                      {t === "system" ? "跟随系统" : t === "light" ? "浅色" : "深色"}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            </section>
-            <section className="panel">
-              <div className="panelTitle">
-                <div>
-                  <h2>窗口与菜单栏</h2>
-                  <p>菜单栏驻留模式会隐藏 Dock 图标，仅菜单栏常驻（重启后生效）</p>
-                </div>
-              </div>
-              <div className="form">
-                <label className="switch">
+              <div className="settingsQuickGrid">
+                <label className="settingGroup idleControl">
+                  <span>离开判定</span>
+                  <input
+                    type="range"
+                    min="1"
+                    max="60"
+                    value={settings.idle_threshold_minutes}
+                    onChange={(event) =>
+                      updateSettings({ idle_threshold_minutes: Number(event.target.value) })
+                    }
+                  />
+                  <strong>{settings.idle_threshold_minutes} 分钟</strong>
+                </label>
+                <label className="settingGroup switch">
+                  <span><Power size={17} />开机自启</span>
+                  <input
+                    type="checkbox"
+                    checked={settings.autostart_enabled}
+                    onChange={(event) => updateSettings({ autostart_enabled: event.target.checked })}
+                  />
+                </label>
+                <label className="settingGroup switch">
                   <span><Power size={17} />菜单栏驻留模式</span>
                   <input
                     type="checkbox"
@@ -781,6 +823,20 @@ function App() {
                     onChange={(event) => updateSettings({ menubar_only: event.target.checked })}
                   />
                 </label>
+                <div className="settingGroup">
+                  <span>外观</span>
+                  <div className="tabs">
+                    {(["system", "light", "dark"] as const).map((t) => (
+                      <button
+                        key={t}
+                        className={settings.theme === t ? "tab active" : "tab"}
+                        onClick={() => updateSettings({ theme: t })}
+                      >
+                        {t === "system" ? "跟随系统" : t === "light" ? "浅色" : "深色"}
+                      </button>
+                    ))}
+                  </div>
+                </div>
               </div>
             </section>
             <section className="panel">
@@ -838,28 +894,19 @@ function App() {
                 </label>
               </div>
             </section>
-            <section className="settings">
-              <label>
-                <span>离开判定</span>
-                <input
-                  type="range"
-                  min="1"
-                  max="60"
-                  value={settings.idle_threshold_minutes}
-                  onChange={(event) =>
-                    updateSettings({ idle_threshold_minutes: Number(event.target.value) })
-                  }
-                />
-                <strong>{settings.idle_threshold_minutes} 分钟</strong>
-              </label>
-              <label className="switch">
-                <span><Power size={17} />开机自启</span>
-                <input
-                  type="checkbox"
-                  checked={settings.autostart_enabled}
-                  onChange={(event) => updateSettings({ autostart_enabled: event.target.checked })}
-                />
-              </label>
+            <section className="panel">
+              <div className="panelTitle">
+                <div>
+                  <h2>隐私说明</h2>
+                  <p>本软件只判断“有没有操作”，不采集任何内容</p>
+                </div>
+              </div>
+              <ul className="privacyList">
+                <li>不读取具体按键，不保存键盘输入内容</li>
+                <li>不保存鼠标坐标，不截图，不读取用户文件</li>
+                <li>默认只保存活动时间、统计分钟数与同步状态</li>
+                <li>数据保存在本机，只有开启同步后才上传服务器</li>
+              </ul>
             </section>
             <section className="panel">
               <div className="panelTitle">
@@ -965,6 +1012,12 @@ function App() {
               </div>
             </section>
           </>
+        )}
+        {saveFeedback && (
+          <div className={`saveToast ${saveFeedback.state}`} role="status" aria-live="polite">
+            <span className="toastDot" />
+            {saveFeedback.message}
+          </div>
         )}
       </section>
     </main>
