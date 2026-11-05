@@ -18,6 +18,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
+use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_shell::ShellExt;
 use tauri_plugin_updater::UpdaterExt;
 
@@ -256,9 +257,11 @@ fn get_settings(state: State<AppState>) -> Result<AppSettings, String> {
         .map_err(|_| "store lock failed".to_string())?
         .get_settings()
         .map_err(|err| err.to_string())?;
-    // 密码/恢复码哈希不下发到前端；保存时由 save_settings 沿用库里的值
+    // 密码/恢复码哈希、同步 Token 均不下发到前端：
+    // 哈希由 save_settings 沿用库里的值；sync_token 按密码式处理（留空表示不修改）
     settings.password_hash.clear();
     settings.recovery_hash.clear();
+    settings.sync_token.clear();
     Ok(settings)
 }
 
@@ -292,6 +295,10 @@ fn save_settings(
         let existing = store.get_settings().map_err(|err| err.to_string())?;
         next.password_hash = existing.password_hash;
         next.recovery_hash = existing.recovery_hash;
+        // sync_token 密码式处理：留空表示不修改，沿用库里已存的值；非空才更新
+        if next.sync_token.trim().is_empty() {
+            next.sync_token = existing.sync_token;
+        }
         store
             .save_settings(&next)
             .map_err(|err| err.to_string())?;
@@ -391,6 +398,7 @@ fn export_db(app: AppHandle) -> Result<String, String> {
         .lock()
         .map_err(|_| "store lock failed".to_string())?;
     store.backup_to(&dest).map_err(|err| err.to_string())?;
+    notify(&app, "已创建数据备份（SQLite 热备）");
     Ok(dest.to_string_lossy().to_string())
 }
 
@@ -426,6 +434,7 @@ async fn restore_db(app: AppHandle) -> Result<String, String> {
         // 恢复后以数据库为准：让采集循环重新加载当天段落，
         // 否则内存里的旧段落会在下一个采样周期把恢复结果覆盖掉
         state.resetting.store(2, Ordering::Relaxed);
+        notify(&app, "已从备份恢复，列表已刷新");
         Ok("已从备份恢复，列表已刷新".into())
     }
 
@@ -444,6 +453,38 @@ async fn restore_db(app: AppHandle) -> Result<String, String> {
             db_path.to_string_lossy()
         ))
     }
+}
+
+#[tauri::command]
+fn export_json(state: State<AppState>) -> Result<String, String> {
+    ensure_unlocked(&state)?;
+    state
+        .store
+        .lock()
+        .map_err(|_| "store lock failed".to_string())?
+        .export_json()
+        .map(|path| path.to_string_lossy().to_string())
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn import_json(app: AppHandle, content: String) -> Result<u32, String> {
+    ensure_unlocked(&app.state::<AppState>())?;
+    let imported = {
+        let state = app.state::<AppState>();
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| "store lock failed".to_string())?;
+        store
+            .import_json(&content)
+            .map_err(|err| err.to_string())?
+    };
+    // 导入后以数据库为准：让采集循环重新加载当天段落，避免内存里旧段落覆盖导入结果
+    let state = app.state::<AppState>();
+    state.resetting.store(2, Ordering::Relaxed);
+    let _ = app.emit("records-updated", ());
+    Ok(imported)
 }
 
 /// 检测更新：仅做版本比对与下载链接提示，不在本机触发安装（安装/签名交由分发流程处理）。
@@ -486,17 +527,16 @@ async fn check_update(app: AppHandle) -> Result<UpdateInfo, String> {
     }
 }
 
-/// 通过 macOS 系统通知提示（无需额外通知插件，复用 shell 调用 osascript）。
-#[cfg(target_os = "macos")]
-fn notify_macos(app: &AppHandle, message: &str) {
-    let safe = message.replace('"', "'");
-    let script = format!("display notification \"{}\" with title \"Activity Worklog\"", safe);
-    let _ = app.shell().command("osascript").args(["-e", &script]).spawn();
+/// 跨平台系统通知（Windows / macOS / Linux 均可用，依赖 tauri-plugin-notification）。
+/// macOS 首次需用户在「系统设置 → 通知 → Activity Worklog」授权，未授权时静默失败。
+fn notify(app: &AppHandle, message: &str) {
+    let _ = app
+        .notification()
+        .builder()
+        .title("Activity Worklog")
+        .body(message)
+        .show();
 }
-
-/// 非 macOS 暂无系统通知通道（Windows 待接入 tauri-plugin-notification），静默跳过。
-#[cfg(not(target_os = "macos"))]
-fn notify_macos(_app: &AppHandle, _message: &str) {}
 
 /// 立即把待同步记录推一次，不等定时器。
 #[tauri::command]
@@ -986,7 +1026,7 @@ fn spawn_activity_loop(app: AppHandle) {
             if idle_for >= Duration::from_secs(30 * 60) {
                 if !away_notified {
                     away_notified = true;
-                    notify_macos(&app, "已离开约 30 分钟，记得起来活动一下");
+                    notify(&app, "已离开约 30 分钟，记得起来活动一下");
                 }
             } else {
                 away_notified = false;
@@ -1115,6 +1155,7 @@ fn main() {
             show_main_window(app);
         }))
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -1226,6 +1267,8 @@ fn main() {
             hourly_activity,
             export_db,
             restore_db,
+            export_json,
+            import_json,
             check_update
         ])
         .build(tauri::generate_context!())

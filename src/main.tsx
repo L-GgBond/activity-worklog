@@ -11,6 +11,7 @@ import {
   Clock3,
   Database,
   Download,
+  FileJson,
   Moon,
   Pause,
   Play,
@@ -869,6 +870,42 @@ function App() {
     }
   }
 
+  async function exportJson() {
+    try {
+      const path = await invoke<string>("export_json");
+      pushLog(`已导出 JSON：${path}`);
+      setStatus("JSON 已导出到本地数据目录");
+    } catch (err) {
+      pushLog(`导出失败：${err}`);
+      setStatus("预览模式：桌面端可导出 JSON");
+    }
+  }
+
+  async function importJson() {
+    try {
+      const input = document.createElement("input");
+      input.type = "file";
+      input.accept = "application/json,.json";
+      input.onchange = async () => {
+        const file = input.files?.[0];
+        if (!file) return;
+        try {
+          const text = await file.text();
+          const days = await invoke<number>("import_json", { content: text });
+          pushLog(`已导入 ${days} 天记录`);
+          setStatus(`已从 JSON 导入 ${days} 天记录`);
+        } catch (err) {
+          pushLog(`导入失败：${err}`);
+          setStatus(`导入失败：${err}`);
+        }
+      };
+      input.click();
+    } catch (err) {
+      pushLog(`导入失败：${err}`);
+      setStatus("预览模式：桌面端可导入 JSON");
+    }
+  }
+
   async function checkForUpdate() {
     setChecking(true);
     setUpdateInfo(null);
@@ -1460,7 +1497,7 @@ function App() {
                 <span>访问 Token</span>
                 <input
                   type="password"
-                  placeholder="与服务器端保持一致"
+                  placeholder="已配置则留空表示不修改，填写即更新"
                   value={settings.sync_token}
                   onChange={(event) => updateSettingsDebounced({ sync_token: event.target.value })}
                 />
@@ -1734,17 +1771,20 @@ function App() {
               </div>
               <div className="form">
                 <div className="formActions">
-                  <button onClick={backupDb}><Download size={16} />备份数据</button>
-                  <button onClick={restoreDb}>恢复备份…</button>
-                  <button
-                    className={`dangerBtn${confirmClear ? " confirming" : ""}`}
-                    onClick={clearAllRecords}
-                  >
-                    <Trash2 size={16} />
-                    {confirmClear ? "再次点击清除全部" : "清除全部记录"}
-                  </button>
-                </div>
-                <p className="hint">清除只删除本机的活动记录，设置与同步配置会保留。</p>
+                <button onClick={backupDb}><Download size={16} />备份数据</button>
+                <button onClick={restoreDb}>恢复备份…</button>
+                <button onClick={exportJson}><FileJson size={16} />导出 JSON</button>
+                <button onClick={importJson}>导入 JSON…</button>
+                <button
+                  className={`dangerBtn${confirmClear ? " confirming" : ""}`}
+                  onClick={clearAllRecords}
+                >
+                  <Trash2 size={16} />
+                  {confirmClear ? "再次点击清除全部" : "清除全部记录"}
+                </button>
+              </div>
+              <p className="hint">SQLite 热备适合整库恢复；JSON 导出含日汇总与逐时段明细，纯文本可读可改，更适合跨机迁移与人工校订。导入会以 JSON 内容全量替换当前记录。</p>
+              <p className="hint">清除只删除本机的活动记录，设置与同步配置会保留。</p>
               </div>
             </section>
             <section className="panel">
@@ -2116,7 +2156,7 @@ function Onboarding({
                 <span>访问 Token</span>
                 <input
                   type="password"
-                  placeholder="与服务器端保持一致"
+                  placeholder="已配置则留空表示不修改，填写即更新"
                   value={settings.sync_token}
                   onChange={(event) => onChange({ sync_token: event.target.value }, true)}
                 />

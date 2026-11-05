@@ -6,6 +6,7 @@ use std::time::Duration;
 use chrono::{DateTime, Local, Timelike};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use serde_json::{from_str, to_string_pretty};
 
 use crate::settings::AppSettings;
 
@@ -13,7 +14,7 @@ use crate::settings::AppSettings;
 /// 不能再把上一段的结束时间直接延长到当前时刻（否则整段空档会被算成工作）。
 const GAP_RESET_SECONDS: i64 = 150;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DailyRecord {
     pub date: String,
     pub first_activity_at: Option<String>,
@@ -383,6 +384,26 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// 全量时段明细（JSON 导出用），不受历史列表窗口限制
+    pub fn list_all_segments(&self) -> anyhow::Result<Vec<ActivitySegment>> {
+        let mut stmt = self.conn.prepare(
+            "
+            select date, started_at, ended_at, segment_type
+            from activity_segments
+            order by date, id
+            ",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ActivitySegment {
+                date: row.get(0)?,
+                started_at: row.get(1)?,
+                ended_at: row.get(2)?,
+                segment_type: row.get(3)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// 历史列表：按日期倒序取窗口内的记录（limit 由前端控制，可「加载更早」）
     pub fn list_daily_records(&self, limit: u32) -> anyhow::Result<Vec<DailyRecord>> {
         let limit = limit.clamp(1, 5000);
@@ -516,6 +537,79 @@ impl Store {
         }
         writer.flush()?;
         Ok(path)
+    }
+
+    /// JSON 全量导出格式：同时包含日汇总与逐时段明细，便于跨机迁移与人工校订。
+    /// 相比 CSV（仅日汇总）补全了时段级数据，相比 SQLite 热备（二进制）是纯文本、可读可改。
+    #[derive(Serialize, Deserialize)]
+    struct JsonExport {
+        version: u32,
+        exported_at: String,
+        daily_work_records: Vec<DailyRecord>,
+        activity_segments: Vec<ActivitySegment>,
+    }
+
+    /// 导出全量数据为 JSON 文件（写入下载目录 / Activity Worklog），返回文件路径。
+    pub fn export_json(&self) -> anyhow::Result<PathBuf> {
+        let dir = dirs::download_dir()
+            .map(|base| base.join("Activity Worklog"))
+            .unwrap_or_else(|| self.data_dir.clone());
+        fs::create_dir_all(&dir)?;
+        // 带时间戳，避免静默覆盖上一次导出
+        let path = dir.join(format!(
+            "worklog-export-{}.json",
+            Local::now().format("%Y%m%d-%H%M%S")
+        ));
+        let payload = JsonExport {
+            version: 1,
+            exported_at: Local::now().to_rfc3339(),
+            daily_work_records: self.list_all_daily_records()?,
+            activity_segments: self.list_all_segments()?,
+        };
+        let text = to_string_pretty(&payload)
+            .map_err(|err| format!("序列化 JSON 失败: {err}"))?;
+        fs::write(&path, text)?;
+        Ok(path)
+    }
+
+    /// 从 JSON 文本导入全量数据：在单个事务内清空两表后重写，保证一致性。
+    /// 留空/无效字段由列约束（segment_type 等）兜底，事务整体回滚并上报错误。
+    /// 返回导入的天数。sync_status 原样保留（ faithful round-trip），导入后按本地需要自行决定是否重新同步。
+    pub fn import_json(&self, content: &str) -> anyhow::Result<u32> {
+        let payload: JsonExport = from_str(content)
+            .map_err(|err| format!("解析 JSON 失败: {err}"))?;
+        if payload.version != 1 {
+            anyhow::bail!("不支持的导出版本: {}", payload.version);
+        }
+        let now = Local::now().to_rfc3339();
+        let tx = self.conn.transaction()?;
+        tx.execute("delete from activity_segments", [])?;
+        tx.execute("delete from daily_work_records", [])?;
+        for rec in &payload.daily_work_records {
+            tx.execute(
+                "insert into daily_work_records
+                 (date, first_activity_at, last_activity_at, active_minutes, idle_minutes, sync_status, updated_at)
+                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    rec.date,
+                    rec.first_activity_at,
+                    rec.last_activity_at,
+                    rec.active_minutes,
+                    rec.idle_minutes,
+                    rec.sync_status,
+                    now
+                ],
+            )?;
+        }
+        for seg in &payload.activity_segments {
+            tx.execute(
+                "insert into activity_segments (date, started_at, ended_at, segment_type)
+                 values (?1, ?2, ?3, ?4)",
+                params![seg.date, seg.started_at, seg.ended_at, seg.segment_type],
+            )?;
+        }
+        tx.commit()?;
+        Ok(payload.daily_work_records.len() as u32)
     }
 
     /// 数据库文件路径（用于备份/恢复）。
