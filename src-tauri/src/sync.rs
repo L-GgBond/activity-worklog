@@ -22,15 +22,16 @@ impl HttpSyncClient {
         }
     }
 
-    /// 上传待同步记录；返回成功时服务端接受的日期列表。
+    /// 上传待同步记录；返回服务端确认接受的日期列表。
     pub async fn push_records(
         &self,
         settings: &AppSettings,
         records: Vec<DailyRecord>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<String>> {
         if records.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
+        let sent: Vec<String> = records.iter().map(|record| record.date.clone()).collect();
         let url = normalize_url(&settings.sync_url);
         if url.is_empty() {
             anyhow::bail!("未配置同步服务器地址");
@@ -49,11 +50,25 @@ impl HttpSyncClient {
 
         let response = request.send().await?;
         let status = response.status();
+        let body = response.text().await.unwrap_or_default();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
             anyhow::bail!("同步服务器返回 {status}: {body}");
         }
-        Ok(())
+
+        // 服务端可返回 {"accepted": ["2026-11-01", ...]} 逐条确认；
+        // 没给这个字段时按“全部接受”处理，兼容旧服务端。
+        let accepted = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| value.get("accepted").and_then(|item| item.as_array()).cloned())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(|value| value.to_string()))
+                    .collect::<Vec<String>>()
+            })
+            .filter(|list| !list.is_empty());
+
+        Ok(accepted.unwrap_or(sent))
     }
 
     /// 测试连接：GET /api/health，校验 Token 与服务可达性。

@@ -40,7 +40,7 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/OWNER/activity-worklog/releases/latest/download/latest.json"
+        "https://github.com/L-GgBond/activity-worklog/releases/latest/download/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk3MjcyMEExOEQzQTA4QUYKUldTdkNEcU5vU0FubDZJWEh4MGpvZDZKUXVNM24wY3dwS2VQaWYvSmxTVktPYTZrWVhpMjMza1oK"
     }

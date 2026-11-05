@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use activity::InputActivityProbe;
 use chrono::{Local, TimeZone};
-use db::{ActivitySegment, DailyRecord, HourBucket, Store};
+use db::{ActivitySegment, DailyRecord, HourBucket, Store, SyncSummary};
 use settings::AppSettings;
 use sync::HttpSyncClient;
 use tauri::menu::{Menu, MenuItem, MenuItemKind};
@@ -22,6 +22,8 @@ use tauri_plugin_updater::UpdaterExt;
 struct AppState {
     store: Mutex<Store>,
     paused: AtomicBool,
+    /// 记录被清空/删除后置位，采集循环据此丢弃内存缓冲，避免下一 tick 又写回
+    resetting: AtomicBool,
 }
 
 #[tauri::command]
@@ -76,6 +78,45 @@ fn save_settings(
 }
 
 #[tauri::command]
+fn delete_day(app: AppHandle, state: State<AppState>, date: String) -> Result<(), String> {
+    state
+        .store
+        .lock()
+        .map_err(|_| "store lock failed".to_string())?
+        .delete_day(&date)
+        .map_err(|err| err.to_string())?;
+    // 删的是今天时，采集循环内存里还留着当天段落，需要让它重新开始
+    if date == Local::now().format("%Y-%m-%d").to_string() {
+        state.resetting.store(true, Ordering::Relaxed);
+    }
+    let _ = app.emit("records-updated", ());
+    Ok(())
+}
+
+#[tauri::command]
+fn clear_all_records(app: AppHandle, state: State<AppState>) -> Result<String, String> {
+    let removed = state
+        .store
+        .lock()
+        .map_err(|_| "store lock failed".to_string())?
+        .clear_records()
+        .map_err(|err| err.to_string())?;
+    state.resetting.store(true, Ordering::Relaxed);
+    let _ = app.emit("records-updated", ());
+    Ok(format!("已清除 {removed} 天记录"))
+}
+
+#[tauri::command]
+fn sync_summary(state: State<AppState>) -> Result<SyncSummary, String> {
+    state
+        .store
+        .lock()
+        .map_err(|_| "store lock failed".to_string())?
+        .sync_summary()
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 fn export_records_csv(state: State<AppState>) -> Result<String, String> {
     state
         .store
@@ -98,47 +139,66 @@ fn hourly_activity(state: State<AppState>, range_days: u32) -> Result<Vec<HourBu
 
 #[tauri::command]
 fn export_db(app: AppHandle) -> Result<String, String> {
-    let path = app
-        .state::<AppState>()
-        .store
-        .lock()
-        .map_err(|_| "store lock failed".to_string())?
-        .db_path();
     let base = dirs::download_dir().ok_or_else(|| "无法定位下载目录".to_string())?;
     let dir = base.join("Activity Worklog");
     std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
     let dest = dir.join(format!(
         "worklog-backup-{}.sqlite3",
-        Local::now().format("%Y%m%d")
+        Local::now().format("%Y%m%d-%H%M%S")
     ));
-    std::fs::copy(&path, &dest).map_err(|err| err.to_string())?;
+    let state = app.state::<AppState>();
+    let store = state
+        .store
+        .lock()
+        .map_err(|_| "store lock failed".to_string())?;
+    store.backup_to(&dest).map_err(|err| err.to_string())?;
     Ok(dest.to_string_lossy().to_string())
 }
 
 #[tauri::command]
 async fn restore_db(app: AppHandle) -> Result<String, String> {
-    let out = app
-        .shell()
-        .command("osascript")
-        .args([
-            "-e",
-            "POSIX path of (choose file with prompt \"选择备份的 worklog.sqlite3 文件\")",
-        ])
-        .output()
-        .await
-        .map_err(|err| err.to_string())?;
-    let src = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if src.is_empty() {
-        return Err("未选择文件".into());
+    #[cfg(target_os = "macos")]
+    {
+        let out = app
+            .shell()
+            .command("osascript")
+            .args([
+                "-e",
+                "POSIX path of (choose file with prompt \"选择备份的 worklog.sqlite3 文件\")",
+            ])
+            .output()
+            .await
+            .map_err(|err| err.to_string())?;
+        let src = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if src.is_empty() {
+            return Err("未选择文件".into());
+        }
+        let state = app.state::<AppState>();
+        let mut store = state
+            .store
+            .lock()
+            .map_err(|_| "store lock failed".to_string())?;
+        store
+            .restore_from(std::path::Path::new(&src))
+            .map_err(|err| err.to_string())?;
+        Ok("已从备份恢复，列表已刷新".into())
     }
-    let path = app
-        .state::<AppState>()
-        .store
-        .lock()
-        .map_err(|_| "store lock failed".to_string())?
-        .db_path();
-    std::fs::copy(&src, &path).map_err(|err| err.to_string())?;
-    Ok("已恢复备份，请重启应用生效".into())
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let db_path = {
+            let state = app.state::<AppState>();
+            let store = state
+                .store
+                .lock()
+                .map_err(|_| "store lock failed".to_string())?;
+            store.db_path()
+        };
+        Err(format!(
+            "当前系统暂未接入文件选择器。请先退出应用，再用备份文件覆盖此文件后重新打开：{}",
+            db_path.to_string_lossy()
+        ))
+    }
 }
 
 /// 检测更新：仅做版本比对与下载链接提示，不在本机触发安装（安装/签名交由分发流程处理）。
@@ -301,6 +361,7 @@ fn spawn_activity_loop(app: AppHandle) {
         };
 
         let mut away_notified = false;
+        let mut probe_failures: u32 = 0;
 
         loop {
             tokio::time::sleep(Duration::from_secs(15)).await;
@@ -344,8 +405,28 @@ fn spawn_activity_loop(app: AppHandle) {
                 .and_then(|store| store.get_settings().ok())
                 .unwrap_or_default();
 
-            let Ok(idle_for) = probe.idle_duration() else {
+            // 用户清空/删除记录后，丢弃内存里的当天段落，避免下一 tick 又写回去
+            if state.resetting.swap(false, Ordering::Relaxed) {
+                segments.clear();
                 continue;
+            }
+
+            let idle_for = match probe.idle_duration() {
+                Ok(value) => {
+                    if probe_failures >= 3 {
+                        let _ = app.emit("capture-ok", ());
+                    }
+                    probe_failures = 0;
+                    value
+                }
+                Err(err) => {
+                    probe_failures += 1;
+                    // 连续失败才提示，避免偶发抖动打扰
+                    if probe_failures == 3 {
+                        let _ = app.emit("capture-error", err.to_string());
+                    }
+                    continue;
+                }
             };
 
             // 超过 12 小时无任何输入视为机器关闭/休眠，不计入离开时长
@@ -445,10 +526,12 @@ fn spawn_sync_loop(app: AppHandle) {
 
             let dates: Vec<String> = pending.iter().map(|record| record.date.clone()).collect();
             match client.push_records(&settings, pending).await {
-                Ok(()) => {
+                Ok(accepted) => {
+                    // 服务端逐条确认时只标记确认过的日期，避免“假已同步”
+                    let synced_dates = if accepted.is_empty() { dates } else { accepted };
                     let state = app.state::<AppState>();
                     if let Ok(store) = state.store.lock() {
-                        let _ = store.mark_synced(&dates);
+                        let _ = store.mark_synced(&synced_dates);
                     }
                     let _ = app.emit("records-updated", ());
                 }
@@ -462,6 +545,10 @@ fn spawn_sync_loop(app: AppHandle) {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            // 重复启动时只把已有窗口叫到前台，不再起第二个采集循环
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -478,6 +565,7 @@ fn main() {
             app.manage(AppState {
                 store: Mutex::new(store),
                 paused: AtomicBool::new(false),
+                resetting: AtomicBool::new(false),
             });
             spawn_activity_loop(app.handle().clone());
             spawn_sync_loop(app.handle().clone());
@@ -495,6 +583,9 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             list_daily_records,
             list_segments,
+            delete_day,
+            clear_all_records,
+            sync_summary,
             get_settings,
             save_settings,
             export_records_csv,

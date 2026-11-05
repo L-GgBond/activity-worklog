@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{DateTime, Local, Timelike};
@@ -8,6 +8,10 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
 use crate::settings::AppSettings;
+
+/// 两次采样间隔只有 15 秒；超过这个缺口说明进程被休眠/关闭过，
+/// 不能再把上一段的结束时间直接延长到当前时刻（否则整段空档会被算成工作）。
+const GAP_RESET_SECONDS: i64 = 150;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DailyRecord {
@@ -25,6 +29,13 @@ pub struct ActivitySegment {
     pub started_at: String,
     pub ended_at: String,
     pub segment_type: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SyncSummary {
+    pub pending: i64,
+    pub synced: i64,
+    pub last_synced_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -115,7 +126,32 @@ impl Store {
         // 当前段落 = 当天最后一段
         let current_idx = segments.iter().rposition(|segment| segment.date == date);
 
+        // 上一段的结束时间与当前时间存在大缺口（休眠 / 进程被挂起）时，
+        // 不延长旧段，直接在缺口之后开新段。
+        let gap_break = match current_idx {
+            Some(idx) => {
+                let last_end = if segments[idx].ended_at.is_empty() {
+                    segments[idx].started_at.clone()
+                } else {
+                    segments[idx].ended_at.clone()
+                };
+                parse_time_seconds(&time) - parse_time_seconds(&last_end) > GAP_RESET_SECONDS
+            }
+            None => false,
+        };
+
         match current_idx {
+            Some(idx) if gap_break => {
+                let floor = segments[idx].started_at.clone();
+                let new_started_at =
+                    self.new_segment_start(&time, &floor, backdate, timestamp, &date);
+                segments.push(ActivitySegment {
+                    date: date.clone(),
+                    started_at: new_started_at,
+                    ended_at: time,
+                    segment_type: desired_type.to_string(),
+                });
+            }
             Some(idx) if segments[idx].segment_type == desired_type => {
                 // 类型不变，仅延长结束时间
                 segments[idx].ended_at = time;
@@ -309,7 +345,7 @@ impl Store {
             select date, first_activity_at, last_activity_at, active_minutes, idle_minutes, sync_status
             from daily_work_records
             order by date desc
-            limit 90
+            limit 366
             ",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -385,7 +421,11 @@ impl Store {
     }
 
     pub fn export_csv(&self) -> anyhow::Result<PathBuf> {
-        let path = self.data_dir.join("daily-work-records.csv");
+        let dir = dirs::download_dir()
+            .map(|base| base.join("Activity Worklog"))
+            .unwrap_or_else(|| self.data_dir.clone());
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("daily-work-records.csv");
         let mut writer = csv::Writer::from_path(&path)?;
         for record in self.list_daily_records()? {
             writer.serialize(record)?;
@@ -397,6 +437,86 @@ impl Store {
     /// 数据库文件路径（用于备份/恢复）。
     pub fn db_path(&self) -> PathBuf {
         self.data_dir.join("worklog.sqlite3")
+    }
+
+    /// 删除某一天的全部记录（日汇总 + 时段），用于纠正误记。
+    pub fn delete_day(&self, date: &str) -> anyhow::Result<()> {
+        self.conn.execute(
+            "delete from activity_segments where date = ?1",
+            params![date],
+        )?;
+        self.conn.execute(
+            "delete from daily_work_records where date = ?1",
+            params![date],
+        )?;
+        Ok(())
+    }
+
+    /// 清空全部活动记录（保留设置），返回删除的天数。
+    pub fn clear_records(&self) -> anyhow::Result<i64> {
+        self.conn.execute("delete from activity_segments", [])?;
+        let removed = self.conn.execute("delete from daily_work_records", [])?;
+        Ok(removed as i64)
+    }
+
+    /// 同步概况：待同步天数 / 已同步天数 / 上次同步时间（落库时间）。
+    pub fn sync_summary(&self) -> anyhow::Result<SyncSummary> {
+        let pending: i64 = self.conn.query_row(
+            "select count(1) from daily_work_records where sync_status = 'pending'",
+            [],
+            |row| row.get(0),
+        )?;
+        let synced: i64 = self.conn.query_row(
+            "select count(1) from daily_work_records where sync_status = 'synced'",
+            [],
+            |row| row.get(0),
+        )?;
+        let last_synced_at: Option<String> = self.conn.query_row(
+            "select max(updated_at) from daily_work_records where sync_status = 'synced'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(SyncSummary {
+            pending,
+            synced,
+            last_synced_at,
+        })
+    }
+
+    /// 用 SQLite 的 VACUUM INTO 生成一致性备份（热备份，不阻塞当前连接）。
+    pub fn backup_to(&self, dest: &Path) -> anyhow::Result<()> {
+        if dest.exists() {
+            fs::remove_file(dest)?;
+        }
+        self.conn.execute(
+            "vacuum into ?1",
+            params![dest.to_string_lossy().to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// 用备份文件替换当前数据库：先校验备份可用，再断开旧句柄、覆盖、重开。
+    /// 直接覆盖运行中的数据库文件会让后续写入落进已被替换的旧 inode。
+    pub fn restore_from(&mut self, source: &Path) -> anyhow::Result<()> {
+        if !source.exists() {
+            anyhow::bail!("备份文件不存在");
+        }
+        {
+            let probe = Connection::open(source)?;
+            probe.query_row("select count(1) from daily_work_records", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        }
+        let target = self.db_path();
+        let staged = self.data_dir.join("worklog.restore.tmp");
+        fs::copy(source, &staged)?;
+        // 先换成内存库释放文件句柄，再覆盖，最后重开
+        self.conn = Connection::open_in_memory()?;
+        fs::copy(&staged, &target)?;
+        let _ = fs::remove_file(&staged);
+        self.conn = Connection::open(&target)?;
+        self.migrate()?;
+        Ok(())
     }
 
     /// 按小时聚合最近 range_days 天的工作（活跃）时长，返回 0..24 每个小时的分钟数。
