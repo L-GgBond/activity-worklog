@@ -17,6 +17,7 @@ use tauri::menu::{Menu, MenuItem, MenuItemKind};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_autostart::ManagerExt;
+use tauri_plugin_global_shortcut::GlobalShortcutExt;
 use tauri_plugin_shell::ShellExt;
 use tauri_plugin_updater::UpdaterExt;
 
@@ -219,6 +220,32 @@ fn list_segments(state: State<AppState>, date: String) -> Result<Vec<ActivitySeg
         .map_err(|err| err.to_string())
 }
 
+/// 手动修正某天的时段：用整段列表覆盖并基于段落重算当日统计。
+/// 今天被编辑时让采集循环从库里重载，避免被内存里的旧段落覆盖。
+#[tauri::command]
+fn save_segments(
+    app: AppHandle,
+    state: State<AppState>,
+    date: String,
+    segments: Vec<ActivitySegment>,
+) -> Result<(), String> {
+    ensure_unlocked(&state)?;
+    {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| "store lock failed".to_string())?;
+        store
+            .replace_day_segments(&date, &segments)
+            .map_err(|err| err.to_string())?;
+    }
+    if date == Local::now().format("%Y-%m-%d").to_string() {
+        state.resetting.store(2, Ordering::Relaxed);
+    }
+    let _ = app.emit("records-updated", ());
+    Ok(())
+}
+
 #[tauri::command]
 fn get_settings(state: State<AppState>) -> Result<AppSettings, String> {
     let mut settings = state
@@ -266,6 +293,17 @@ fn save_settings(
         store
             .save_settings(&next)
             .map_err(|err| err.to_string())?;
+    }
+    // 数据保留期：保存设置后立即清理过期记录，并通知前端刷新列表
+    if next.retention_days > 0 {
+        let cutoff = (Local::now().date_naive()
+            - chrono::Duration::days(next.retention_days as i64))
+            .format("%Y-%m-%d")
+            .to_string();
+        if let Ok(store) = state.store.lock() {
+            let _ = store.purge_old_records(&cutoff);
+        }
+        let _ = app.emit("records-updated", ());
     }
     Ok(())
 }
@@ -561,6 +599,7 @@ fn unlock(app: AppHandle, state: State<AppState>, password: String) -> Result<()
         state.clear_auth_failures();
         state.unlocked.store(true, Ordering::Relaxed);
         let _ = app.emit("unlocked", ());
+        set_tray_lock_status(&app, false);
         return Ok(());
     }
 
@@ -745,12 +784,13 @@ fn export_report(filename: String, data: Vec<u8>, ext: String) -> Result<String,
 }
 
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
+    let status = MenuItem::with_id(app, "status", "状态：已解锁 🔓", false, None::<&str>)?;
     let show = MenuItem::with_id(app, "show", "显示记录", true, None::<&str>)?;
     let summary = MenuItem::with_id(app, "summary", "今日小结", true, None::<&str>)?;
     let pause = MenuItem::with_id(app, "pause", "暂停记录", true, None::<&str>)?;
     let lock = MenuItem::with_id(app, "lock", "锁定并隐藏", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &summary, &pause, &lock, &quit])?;
+    let menu = Menu::with_items(app, &[&status, &show, &summary, &pause, &lock, &quit])?;
 
     let icon = app
         .default_window_icon()
@@ -785,6 +825,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                     if let Some(tray) = app.tray_by_id("main") {
                         let _ = tray.set_tooltip(Some("Activity Worklog · 已锁定"));
                     }
+                    set_tray_lock_status(app, true);
                 }
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.hide();
@@ -815,6 +856,21 @@ fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.set_focus();
+    }
+}
+
+/// 在托盘菜单顶部展示锁定状态文字（已锁定 / 已解锁），让隐藏入口下的安全状态可见。
+fn set_tray_lock_status(app: &AppHandle, locked: bool) {
+    if let Some(tray) = app.tray_by_id("main") {
+        if let Some(menu) = tray.menu() {
+            if let Some(MenuItemKind::MenuItem(item)) = menu.get("status") {
+                let _ = item.set_text(if locked {
+                    "状态：已锁定 🔒"
+                } else {
+                    "状态：已解锁 🔓"
+                });
+            }
+        }
     }
 }
 
@@ -1057,6 +1113,7 @@ fn main() {
             show_main_window(app);
         }))
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
@@ -1072,15 +1129,24 @@ fn main() {
             }
             setup_tray(app.handle())?;
             let store = Store::open()?;
+            // 读取启动需要的设置：锁定态与保留期都从这里取，避免重复查库
+            let settings0 = store.get_settings().unwrap_or_default();
             // 启动时若设过密码，先处于锁定态，前端只渲染锁屏
-            let locked = store
-                .get_settings()
-                .map(|settings| !settings.password_hash.is_empty())
-                .unwrap_or(false);
+            let locked = !settings0.password_hash.is_empty();
+            // 数据保留期：启动时清理过期记录（0 表示永久保留）
+            if settings0.retention_days > 0 {
+                let cutoff = (Local::now().date_naive()
+                    - chrono::Duration::days(settings0.retention_days as i64))
+                    .format("%Y-%m-%d")
+                    .to_string();
+                let _ = store.purge_old_records(&cutoff);
+            }
+            // 托盘菜单顶部的锁定状态项与实际启动态对齐
+            set_tray_lock_status(app.handle(), locked);
             // 隐藏 Dock 图标，仅菜单栏常驻（仅 macOS 有此机制；需重启生效）
             #[cfg(target_os = "macos")]
             {
-                if store.get_settings().map(|s| s.menubar_only).unwrap_or(false) {
+                if settings0.menubar_only {
                     let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
                 }
             }
@@ -1105,6 +1171,10 @@ fn main() {
                 cooldown_until: Mutex::new(cooldown),
                 auth_throttle_path,
             });
+            // 全局快捷键：Cmd/Ctrl+Shift+A 在隐藏或锁定时也能唤出窗口（锁定时显示锁屏）
+            let _ = app.global_shortcut().register("CmdOrCtrl+Shift+A", |handle, _shortcut| {
+                show_main_window(handle);
+            });
             spawn_activity_loop(app.handle().clone());
             spawn_sync_loop(app.handle().clone());
             Ok(())
@@ -1124,6 +1194,7 @@ fn main() {
                         if let Some(tray) = app.tray_by_id("main") {
                             let _ = tray.set_tooltip(Some("Activity Worklog · 已锁定"));
                         }
+                        set_tray_lock_status(&app, true);
                     }
                 }
             }
@@ -1138,6 +1209,7 @@ fn main() {
             list_daily_records,
             count_daily_records,
             list_segments,
+            save_segments,
             delete_day,
             clear_all_records,
             sync_summary,

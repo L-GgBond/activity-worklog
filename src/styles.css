@@ -2749,3 +2749,139 @@ input[type="range"]::-moz-range-thumb {
 .statusProblem {
   color: var(--danger);
 }
+
+/* 展开时段头部：标题 + 编辑/保存操作 */
+.rowDetailHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 2px;
+}
+.rowDetailTitle {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+}
+.rowDetailActions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 时段编辑态：从只读网格换成可输入行 */
+.segmentRow.edit {
+  display: grid;
+  grid-template-columns: 56px 92px 12px 92px auto 28px;
+  align-items: center;
+  column-gap: 8px;
+}
+.segmentRow.edit select,
+.segmentRow.edit input[type="time"] {
+  height: 26px;
+  padding: 0 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-xs);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12px;
+}
+.segmentRow.edit.invalid select,
+.segmentRow.edit.invalid input[type="time"] {
+  border-color: var(--danger);
+}
+.segDash {
+  color: var(--text-faint);
+}
+.segErr {
+  color: var(--danger);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+/* 行内图标按钮 */
+.iconBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-xs);
+  background: var(--surface);
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.iconBtn:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+.iconBtn.danger:hover {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+/* 文字型链接按钮 */
+.linkBtn {
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--accent);
+  font-size: 12px;
+  cursor: pointer;
+}
+.linkBtn:hover {
+  text-decoration: underline;
+}
+.linkBtn:disabled {
+  color: var(--text-faint);
+  cursor: default;
+  text-decoration: none;
+}
+
+/* 小号主按钮（时段保存等） */
+button.primary.sm {
+  min-height: 26px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+/* 设置项说明文字 */
+.fieldHint {
+  display: block;
+  margin-top: 4px;
+  color: var(--text-faint);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+/* 首次启动提示横幅 */
+.firstRunTip {
+  position: fixed;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  max-width: 560px;
+  padding: 10px 14px;
+  border: 1px solid var(--accent-line, var(--accent));
+  border-radius: var(--r-md);
+  background: var(--surface);
+  box-shadow: var(--shadow, 0 6px 20px rgba(0, 0, 0, 0.16));
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.firstRunTip kbd {
+  display: inline-block;
+  padding: 1px 6px;
+  border: 1px solid var(--border-strong);
+  border-bottom-width: 2px;
+  border-radius: var(--r-xs);
+  background: var(--surface-3);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+}

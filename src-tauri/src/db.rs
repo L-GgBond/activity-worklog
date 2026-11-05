@@ -543,6 +543,43 @@ impl Store {
         Ok(removed as i64)
     }
 
+    /// 用前端传回的整段列表覆盖某天的时段，并重算当日统计（置 pending）。
+    /// 同时做基础校验：日期一致、起止非空、开始不晚于结束、类型合法。
+    /// 让用户手动修正误记的时段，而不必整日删除。
+    pub fn replace_day_segments(&self, date: &str, segments: &[ActivitySegment]) -> anyhow::Result<()> {
+        for seg in segments {
+            if seg.date != date {
+                anyhow::bail!("时段日期与请求日期不一致");
+            }
+            if seg.started_at.is_empty() || seg.ended_at.is_empty() {
+                anyhow::bail!("时段的起止时间不能为空");
+            }
+            if seg.segment_type != "work" && seg.segment_type != "away" {
+                anyhow::bail!("时段类型无效，只能是 work 或 away");
+            }
+            if parse_time_seconds(&seg.started_at) > parse_time_seconds(&seg.ended_at) {
+                anyhow::bail!("开始时间不能晚于结束时间");
+            }
+        }
+        self.persist_day_segments(date, segments)?;
+        let stats = segment_stats(segments, date);
+        let updated_at = Local::now().to_rfc3339();
+        self.upsert_daily_stats(date, &stats, &updated_at)?;
+        Ok(())
+    }
+
+    /// 数据保留期清理：删除早于 cutoff（不含）的日汇总与对应时段。
+    /// cutoff 格式 "YYYY-MM-DD"，返回被删除的天数。
+    pub fn purge_old_records(&self, cutoff: &str) -> anyhow::Result<i64> {
+        self.conn
+            .execute("delete from activity_segments where date < ?1", params![cutoff])?;
+        let removed = self.conn.execute(
+            "delete from daily_work_records where date < ?1",
+            params![cutoff],
+        )?;
+        Ok(removed as i64)
+    }
+
     /// 同步概况：待同步天数 / 已同步天数 / 上次同步时间（落库时间）。
     pub fn sync_summary(&self) -> anyhow::Result<SyncSummary> {
         let pending: i64 = self.conn.query_row(

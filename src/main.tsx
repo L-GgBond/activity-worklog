@@ -59,6 +59,7 @@ type Settings = {
   window_height: number;
   theme: "system" | "light" | "dark";
   daily_target_minutes: number;
+  retention_days: number;
   menubar_only: boolean;
 };
 
@@ -91,6 +92,7 @@ const defaultSettings: Settings = {
   window_height: 0,
   theme: "system",
   daily_target_minutes: 480,
+  retention_days: 0,
   menubar_only: false
 };
 
@@ -256,6 +258,9 @@ function App() {
   const [expandedSegments, setExpandedSegments] = useState<Segment[]>([]);
   const [expandedLoading, setExpandedLoading] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
+  const [editMode, setEditMode] = useState(false);
+  const [editSegments, setEditSegments] = useState<Segment[]>([]);
+  const [firstRunTip, setFirstRunTip] = useState(false);
 
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
@@ -567,6 +572,8 @@ function App() {
   async function toggleDay(date: string) {
     if (expandedDate === date) {
       setExpandedDate(null);
+      setEditMode(false);
+      setEditSegments([]);
       return;
     }
     setExpandedDate(date);
@@ -582,6 +589,51 @@ function App() {
       );
     } finally {
       setExpandedLoading(false);
+    }
+  }
+
+  function startEdit(date: string) {
+    setEditSegments(expandedSegments.map((seg) => ({ ...seg })));
+    setEditMode(true);
+  }
+
+  function cancelEdit() {
+    setEditMode(false);
+    setEditSegments([]);
+  }
+
+  function updateEditSegment(index: number, patch: Partial<Segment>) {
+    setEditSegments((prev) => prev.map((seg, i) => (i === index ? { ...seg, ...patch } : seg)));
+  }
+
+  function removeEditSegment(index: number) {
+    setEditSegments((prev) => prev.filter((_, i) => i !== index));
+  }
+
+  function addEditSegment(date: string) {
+    setEditSegments((prev) => [
+      ...prev,
+      { date, started_at: "09:00:00", ended_at: "09:30:00", segment_type: "work" }
+    ]);
+  }
+
+  async function saveEdit(date: string) {
+    const list = editSegments.filter((seg) => seg.date === date);
+    for (const seg of list) {
+      if (seg.started_at.slice(0, 5) > seg.ended_at.slice(0, 5)) {
+        pushLog("保存失败：存在开始时间晚于结束时间的时段");
+        return;
+      }
+    }
+    try {
+      await invoke("save_segments", { date, segments: list });
+      pushLog(`已保存 ${date} 的时段`);
+      setExpandedSegments(list.map((seg) => ({ ...seg })));
+      setEditMode(false);
+      setEditSegments([]);
+      await refresh();
+    } catch (err) {
+      pushLog(`保存时段失败：${err}`);
     }
   }
 
@@ -701,6 +753,13 @@ function App() {
   async function finishOnboarding() {
     await updateSettings({ onboarded: true });
     setStatus("已完成首次设置");
+    // 首次引导完成后才提示后台入口与全局快捷键（此刻主界面已可见），
+    // 避免启动时事件竞态或在引导页背后弹提示。
+    try {
+      if (localStorage.getItem("awl-firstrun-tip") !== "1") setFirstRunTip(true);
+    } catch {
+      setFirstRunTip(true);
+    }
   }
 
   async function handleExport() {
@@ -857,6 +916,36 @@ function App() {
     return () => unlisten?.();
   }, []);
 
+  // 首次启动提示：告知后台入口与全局快捷键，避免装完找不到应用。
+  // 用 localStorage 记住已关闭，重启后不再打扰。
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    (async () => {
+      try {
+        unlisten = await listen("first-run-tip", () => {
+          try {
+            if (localStorage.getItem("awl-firstrun-tip") === "1") return;
+          } catch {
+            // 忽略隐私模式下的存储异常
+          }
+          setFirstRunTip(true);
+        });
+      } catch {
+        // 预览模式无事件通道
+      }
+    })();
+    return () => unlisten?.();
+  }, []);
+
+  function dismissFirstRunTip() {
+    setFirstRunTip(false);
+    try {
+      localStorage.setItem("awl-firstrun-tip", "1");
+    } catch {
+      // 忽略隐私模式下的存储异常
+    }
+  }
+
   if (!ready) {
     return (
       <main className="shell">
@@ -883,6 +972,17 @@ function App() {
 
   return (
     <main className="shell">
+      {firstRunTip && (
+        <div className="firstRunTip" role="status">
+          <span>
+            应用已在后台运行：点击顶部菜单栏 / 托盘图标可随时唤出，快捷键{" "}
+            <kbd>Cmd/Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd> 也能快速打开。
+          </span>
+          <button className="linkBtn" onClick={dismissFirstRunTip}>
+            知道了
+          </button>
+        </div>
+      )}
       <aside className="sidebar">
         <div className="brand">
           <div className="brandMark">
@@ -1192,11 +1292,40 @@ function App() {
                       </div>
                       {open && (
                         <div className="rowDetail">
+                          <div className="rowDetailHead">
+                            <span className="rowDetailTitle">当日时段</span>
+                            {!isPreview && !editMode && (
+                              <button
+                                className="linkBtn"
+                                onClick={() => startEdit(record.date)}
+                                disabled={expandedLoading}
+                              >
+                                编辑时段
+                              </button>
+                            )}
+                            {!isPreview && editMode && (
+                              <span className="rowDetailActions">
+                                <button className="linkBtn" onClick={() => addEditSegment(record.date)}>
+                                  + 添加时段
+                                </button>
+                                <button className="primary sm" onClick={() => saveEdit(record.date)}>
+                                  保存
+                                </button>
+                                <button className="linkBtn" onClick={cancelEdit}>
+                                  取消
+                                </button>
+                              </span>
+                            )}
+                          </div>
                           {expandedLoading && <span className="rowDetailEmpty">读取时段…</span>}
-                          {!expandedLoading && expandedSegments.length === 0 && (
-                            <span className="rowDetailEmpty">这一天没有时段记录</span>
-                          )}
                           {!expandedLoading &&
+                            (editMode ? editSegments : expandedSegments).length === 0 && (
+                              <span className="rowDetailEmpty">
+                                {editMode ? "还没有时段，点「添加时段」新增" : "这一天没有时段记录"}
+                              </span>
+                            )}
+                          {!expandedLoading &&
+                            !editMode &&
                             expandedSegments.map((segment, index) => {
                               const minutes = Math.max(
                                 Math.round(
@@ -1219,6 +1348,53 @@ function App() {
                                     {shortTime(segment.started_at)} – {shortTime(segment.ended_at)}
                                   </span>
                                   <span className="segmentDur">{formatSpan(minutes)}</span>
+                                </div>
+                              );
+                            })}
+                          {!expandedLoading &&
+                            editMode &&
+                            editSegments.map((seg, index) => {
+                              const invalid = seg.started_at.slice(0, 5) > seg.ended_at.slice(0, 5);
+                              return (
+                                <div
+                                  className={`segmentRow edit ${seg.segment_type} ${invalid ? "invalid" : ""}`}
+                                  key={`edit-${index}`}
+                                >
+                                  <select
+                                    value={seg.segment_type}
+                                    onChange={(e) =>
+                                      updateEditSegment(
+                                        index,
+                                        { segment_type: e.target.value as Segment["segment_type"] }
+                                      )
+                                    }
+                                  >
+                                    <option value="work">工作</option>
+                                    <option value="away">离开</option>
+                                  </select>
+                                  <input
+                                    type="time"
+                                    value={seg.started_at.slice(0, 5)}
+                                    onChange={(e) =>
+                                      updateEditSegment(index, { started_at: `${e.target.value}:00` })
+                                    }
+                                  />
+                                  <span className="segDash">–</span>
+                                  <input
+                                    type="time"
+                                    value={seg.ended_at.slice(0, 5)}
+                                    onChange={(e) =>
+                                      updateEditSegment(index, { ended_at: `${e.target.value}:00` })
+                                    }
+                                  />
+                                  {invalid && <span className="segErr">起止无效</span>}
+                                  <button
+                                    className="iconBtn danger"
+                                    onClick={() => removeEditSegment(index)}
+                                    aria-label="删除时段"
+                                  >
+                                    <Trash2 size={13} />
+                                  </button>
                                 </div>
                               );
                             })}
@@ -1455,6 +1631,20 @@ function App() {
                     }
                   />
                 </label>
+                <label>
+                  <span>数据保留期（天）</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={3650}
+                    step={1}
+                    value={settings.retention_days}
+                    onChange={(event) =>
+                      updateSettingsDebounced({ retention_days: Number(event.target.value) || 0 })
+                    }
+                  />
+                  <small className="fieldHint">0 表示永久保留；大于 0 时只保留最近 N 天，其余在保存设置时清理</small>
+                </label>
               </div>
             </section>
             <section className="panel">
@@ -1501,7 +1691,7 @@ function App() {
                 </div>
                 <div className="aboutRow">
                   <span>快捷键</span>
-                  <strong>⌘R 刷新 · ⌘, 打开设置 · ⌘1–4 切换页面</strong>
+                  <strong>⌘R 刷新 · ⌘, 设置 · ⌘1–4 切页 · ⌘/Ctrl+Shift+A 唤出窗口</strong>
                 </div>
                 {updateInfo && updateInfo.status === "available" && (
                   <div className="updateBox">

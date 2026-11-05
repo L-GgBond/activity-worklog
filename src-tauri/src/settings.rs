@@ -33,6 +33,9 @@ pub struct AppSettings {
     // 每日目标活跃时长（分钟），0 表示不设置目标
     #[serde(default = "default_daily_target")]
     pub daily_target_minutes: u32,
+    // 数据保留期（天）：0 表示永久保留；大于 0 时只保留最近 N 天，其余在保存设置/启动时清理
+    #[serde(default)]
+    pub retention_days: u32,
     // 菜单栏驻留模式：隐藏 Dock 图标，仅菜单栏常驻
     #[serde(default)]
     pub menubar_only: bool,
@@ -90,6 +93,7 @@ impl Default for AppSettings {
             window_height: 0,
             theme: default_theme(),
             daily_target_minutes: default_daily_target(),
+            retention_days: 0,
             menubar_only: true,
             password_hash: String::new(),
             recovery_hash: String::new(),
