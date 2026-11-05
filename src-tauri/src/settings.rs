@@ -36,6 +36,12 @@ pub struct AppSettings {
     // 菜单栏驻留模式：隐藏 Dock 图标，仅菜单栏常驻
     #[serde(default)]
     pub menubar_only: bool,
+    // 应用锁：argon2id PHC 字符串，空表示未启用
+    #[serde(default)]
+    pub password_hash: String,
+    // 恢复码的哈希（同样 argon2id），用于忘记密码时重设
+    #[serde(default)]
+    pub recovery_hash: String,
 }
 
 fn default_work_start() -> String {
@@ -84,7 +90,9 @@ impl Default for AppSettings {
             window_height: 0,
             theme: default_theme(),
             daily_target_minutes: default_daily_target(),
-            menubar_only: false,
+            menubar_only: true,
+            password_hash: String::new(),
+            recovery_hash: String::new(),
         }
     }
 }

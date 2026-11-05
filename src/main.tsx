@@ -66,6 +66,11 @@ type Settings = {
 
 type Page = "records" | "analytics" | "sync" | "settings";
 
+type AuthState = {
+  hasPassword: boolean;
+  unlocked: boolean;
+};
+
 type SyncSummary = {
   pending: number;
   synced: number;
@@ -246,6 +251,7 @@ function App() {
   const [paused, setPaused] = useState(false);
   const [syncInfo, setSyncInfo] = useState<SyncSummary | null>(null);
   const [manualSyncing, setManualSyncing] = useState(false);
+  const [auth, setAuth] = useState<AuthState | null>(null);
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   const [monthFilter, setMonthFilter] = useState("");
   const [expandedDate, setExpandedDate] = useState<string | null>(null);
@@ -258,6 +264,9 @@ function App() {
 
   const pausedRef = useRef(paused);
   pausedRef.current = paused;
+
+  const authRef = useRef(auth);
+  authRef.current = auth;
 
   const recordsRef = useRef(records);
   recordsRef.current = records;
@@ -330,16 +339,47 @@ function App() {
   useEffect(() => {
     let unlisten: (() => void) | null = null;
     (async () => {
-      await refresh();
+      let locked = false;
+      try {
+        const state = await invoke<AuthState>("auth_state");
+        setAuth(state);
+        // 锁着就不去读记录，避免数据先到前端
+        locked = state.hasPassword && !state.unlocked;
+      } catch {
+        // 预览模式没有 auth_state，按已解锁处理
+      }
+      if (!locked) await refresh();
       setReady(true);
       try {
-        unlisten = await listen("records-updated", () => refresh());
+        unlisten = await listen("records-updated", () => {
+          const current = authRef.current;
+          if (current?.hasPassword && !current.unlocked) return;
+          refresh();
+        });
       } catch {
         // 预览模式无事件通道
       }
     })();
     return () => unlisten?.();
   }, [refresh]);
+
+  // 窗口被隐藏/托盘锁定时，立刻清掉内存里的数据并切回锁屏
+  useEffect(() => {
+    let off: (() => void) | null = null;
+    (async () => {
+      try {
+        off = await listen("locked", () => {
+          setAuth((prev) => (prev ? { ...prev, unlocked: false } : prev));
+          setRecords([]);
+          setSegments([]);
+          setExpandedDate(null);
+        });
+      } catch {
+        // 预览模式无事件通道
+      }
+    })();
+    return () => off?.();
+  }, []);
 
   // 暂停状态可能在托盘里被改，窗口重新获得焦点时同步一次
   useEffect(() => {
@@ -771,6 +811,18 @@ function App() {
       <main className="shell">
         <section className="workspace loading">加载中…</section>
       </main>
+    );
+  }
+
+  // 锁优先于首次引导：没解锁连引导都不显示
+  if (auth?.hasPassword && !auth.unlocked) {
+    return (
+      <LockScreen
+        onUnlocked={async () => {
+          setAuth({ hasPassword: true, unlocked: true });
+          await refresh();
+        }}
+      />
     );
   }
 
@@ -1281,6 +1333,11 @@ function App() {
                 </div>
               </div>
             </section>
+            <SecurityPanel
+              hasPassword={auth?.hasPassword ?? false}
+              onChanged={(hasPassword) => setAuth({ hasPassword, unlocked: true })}
+              pushLog={pushLog}
+            />
             <section className="panel">
               <div className="panelTitle">
                 <div>
@@ -1460,6 +1517,275 @@ function App() {
         )}
       </section>
     </main>
+  );
+}
+
+/* ---------------- 应用锁 ---------------- */
+
+function LockScreen({ onUnlocked }: { onUnlocked: () => void }) {
+  const [mode, setMode] = useState<"password" | "recovery">("password");
+  const [password, setPassword] = useState("");
+  const [code, setCode] = useState("");
+  const [next, setNext] = useState("");
+  const [issued, setIssued] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function submitPassword(event: React.FormEvent) {
+    event.preventDefault();
+    if (busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      await invoke("unlock", { password });
+      onUnlocked();
+    } catch (err) {
+      setError(String(err));
+      setPassword("");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function submitRecovery(event: React.FormEvent) {
+    event.preventDefault();
+    if (busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      const recovery = await invoke<string>("reset_password_with_recovery", { code, next });
+      setIssued(recovery);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const onSubmit = issued
+    ? (event: React.FormEvent) => {
+        event.preventDefault();
+        onUnlocked();
+      }
+    : mode === "password"
+    ? submitPassword
+    : submitRecovery;
+
+  return (
+    <main className="lockScreen">
+      <form className="lockCard" onSubmit={onSubmit}>
+        <div className="brand">
+          <div className="brandMark">
+            <Activity size={17} />
+          </div>
+          <div>
+            <strong>Activity Worklog</strong>
+            <span>{issued ? "恢复成功" : mode === "recovery" ? "用恢复码重设密码" : "应用已锁定"}</span>
+          </div>
+        </div>
+
+        {issued ? (
+          <>
+            <p className="lockHint">密码已重设，新的恢复码只显示这一次：</p>
+            <code className="lockCode">{issued}</code>
+            <button className="primary" type="submit">
+              我已保存，进入应用
+            </button>
+          </>
+        ) : mode === "password" ? (
+          <>
+            <label className="lockField">
+              <span>密码</span>
+              <input
+                type="password"
+                autoFocus
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                placeholder="输入应用锁密码"
+              />
+            </label>
+            {error && <p className="lockError">{error}</p>}
+            <button className="primary" type="submit" disabled={busy || !password}>
+              {busy ? "解锁中…" : "解锁"}
+            </button>
+            <button
+              type="button"
+              className="lockLink"
+              onClick={() => {
+                setMode("recovery");
+                setError("");
+              }}
+            >
+              忘记密码？用恢复码
+            </button>
+          </>
+        ) : (
+          <>
+            <label className="lockField">
+              <span>恢复码</span>
+              <input
+                value={code}
+                onChange={(event) => setCode(event.target.value)}
+                placeholder="XXXX-XXXX-XXXX-XXXX"
+                autoComplete="off"
+                spellCheck={false}
+              />
+            </label>
+            <label className="lockField">
+              <span>新密码（至少 6 位）</span>
+              <input
+                type="password"
+                value={next}
+                onChange={(event) => setNext(event.target.value)}
+              />
+            </label>
+            {error && <p className="lockError">{error}</p>}
+            <button className="primary" type="submit" disabled={busy || !code || next.length < 6}>
+              {busy ? "处理中…" : "重设并解锁"}
+            </button>
+            <button
+              type="button"
+              className="lockLink"
+              onClick={() => {
+                setMode("password");
+                setError("");
+              }}
+            >
+              返回密码解锁
+            </button>
+          </>
+        )}
+      </form>
+    </main>
+  );
+}
+
+function SecurityPanel({
+  hasPassword,
+  onChanged,
+  pushLog
+}: {
+  hasPassword: boolean;
+  onChanged: (hasPassword: boolean) => void;
+  pushLog: (message: string) => void;
+}) {
+  const [current, setCurrent] = useState("");
+  const [next, setNext] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [error, setError] = useState("");
+  const [recovery, setRecovery] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    setError("");
+    if (next.length < 6) {
+      setError("新密码至少 6 位");
+      return;
+    }
+    if (next !== confirm) {
+      setError("两次输入的新密码不一致");
+      return;
+    }
+    setBusy(true);
+    try {
+      const code = await invoke<string>("set_password", { current, next });
+      setRecovery(code);
+      setCurrent("");
+      setNext("");
+      setConfirm("");
+      onChanged(true);
+      pushLog(hasPassword ? "应用锁密码已更新" : "应用锁已开启");
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function disable() {
+    setError("");
+    setBusy(true);
+    try {
+      await invoke("disable_lock", { current });
+      setRecovery("");
+      setCurrent("");
+      onChanged(false);
+      pushLog("应用锁已关闭");
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="panel">
+      <div className="panelTitle">
+        <div>
+          <h2>应用锁</h2>
+          <p>
+            {hasPassword
+              ? "已开启：启动、隐藏窗口或托盘锁定后，都需要密码才能看到记录"
+              : "开启后，打开应用或从托盘唤出都需要先输入密码"}
+          </p>
+        </div>
+      </div>
+      <form className="form" onSubmit={submit}>
+        {hasPassword && (
+          <label>
+            <span>当前密码</span>
+            <input
+              type="password"
+              value={current}
+              onChange={(event) => setCurrent(event.target.value)}
+              autoComplete="current-password"
+            />
+          </label>
+        )}
+        <label>
+          <span>{hasPassword ? "新密码" : "设置密码（至少 6 位）"}</span>
+          <input
+            type="password"
+            value={next}
+            onChange={(event) => setNext(event.target.value)}
+            autoComplete="new-password"
+          />
+        </label>
+        <label>
+          <span>确认密码</span>
+          <input
+            type="password"
+            value={confirm}
+            onChange={(event) => setConfirm(event.target.value)}
+            autoComplete="new-password"
+          />
+        </label>
+        {error && <p className="lockError">{error}</p>}
+        <div className="formActions">
+          <button className="primary" type="submit" disabled={busy}>
+            {busy ? "处理中…" : hasPassword ? "修改密码" : "启用应用锁"}
+          </button>
+          {hasPassword && (
+            <button
+              type="button"
+              className="dangerBtn"
+              onClick={disable}
+              disabled={busy || !current}
+            >
+              关闭应用锁
+            </button>
+          )}
+        </div>
+        {recovery && (
+          <div className="recoveryBox">
+            <p>恢复码（只显示这一次，请立刻抄下来保存）：</p>
+            <code>{recovery}</code>
+            <p className="hint">忘记密码时用它重设；恢复码也丢了，就只能清空全部数据重新开始。</p>
+          </div>
+        )}
+      </form>
+    </section>
   );
 }
 

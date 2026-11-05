@@ -19,6 +19,7 @@
         "minHeight": 600,
         "visible": true,
         "resizable": true,
+        "skipTaskbar": true,
         "titleBarStyle": "Overlay"
       }
     ],
