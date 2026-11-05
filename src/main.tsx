@@ -20,8 +20,6 @@ import {
   SlidersHorizontal,
   Target
 } from "lucide-react";
-import { toBlob } from "html-to-image";
-import { jsPDF } from "jspdf";
 import "./styles.css";
 
 type DailyRecord = {
@@ -302,24 +300,43 @@ function App() {
       : "err"
     : "";
 
+  // 采集失败时（macOS 未授权输入监控最常见），今日面板不再假装“正常”
+  const captureProblem = status.startsWith("无法读取");
+
+  // 历史记录加载窗口：默认 366 天，可「加载更早」
+  const [recordLimit, setRecordLimit] = useState(366);
+  const recordLimitRef = useRef(366);
+  recordLimitRef.current = recordLimit;
+  const [totalCount, setTotalCount] = useState(0);
+
   const refresh = useCallback(async () => {
     try {
-      const [loadedRecords, loadedSettings, loadedSync] = await Promise.all([
-        invoke<DailyRecord[]>("list_daily_records"),
+      const [loadedRecords, loadedSettings, loadedSync, total] = await Promise.all([
+        invoke<DailyRecord[]>("list_daily_records", { limit: recordLimitRef.current }),
         invoke<Settings>("get_settings"),
-        invoke<SyncSummary>("sync_summary").catch(() => null)
+        invoke<SyncSummary>("sync_summary").catch(() => null),
+        invoke<number>("count_daily_records").catch(() => 0)
       ]);
       setRecords(loadedRecords);
       setSettings(loadedSettings);
       setSyncInfo(loadedSync);
+      setTotalCount(Number(total) || loadedRecords.length);
       setIsPreview(false);
-      setStatus(pausedRef.current ? "记录已暂停" : "后台监听已开启");
+      // 状态行只承载“监听/暂停”这类持久状态；操作提示（备份、小结等）不被周期刷新覆盖
+      setStatus((prev) =>
+        prev === "" || prev.startsWith("正在读取")
+          ? pausedRef.current
+            ? "记录已暂停"
+            : "后台监听已开启"
+          : prev
+      );
       return loadedSettings;
     } catch {
       setIsPreview(true);
       if (inTauri) {
         setRecords([]);
         setSegments([]);
+        setTotalCount(0);
         setStatus("本地数据读取失败，请重启应用");
       } else {
         // 浏览器预览：没有本地服务，用演示数据渲染完整界面
@@ -330,6 +347,7 @@ function App() {
           synced: 26,
           last_synced_at: new Date(Date.now() - 36e5).toISOString()
         });
+        setTotalCount(fallbackRecords.length);
         setStatus("预览模式：未连接本地服务，展示演示数据");
       }
       return null;
@@ -421,7 +439,11 @@ function App() {
     if (!todayStr) return;
     invoke<Segment[]>("list_segments", { date: todayStr })
       .then(setSegments)
-      .catch(() => setSegments(fallbackSegments));
+      .catch(() => {
+        // 只有浏览器预览才允许演示时段；桌面端读取失败一律置空，绝不显示假数据
+        if (!inTauri) setSegments(fallbackSegments);
+        else setSegments([]);
+      });
   }, [todayStr, records]);
 
   // 键盘快捷键：⌘/Ctrl+R 刷新、⌘/Ctrl+, 打开设置、⌘/Ctrl+1..4 切换页面
@@ -471,7 +493,7 @@ function App() {
         const lh = Math.round(size.height / sf);
         if (timer) window.clearTimeout(timer);
         timer = window.setTimeout(() => {
-          updateSettings({ window_width: lw, window_height: lh }, true);
+          updateSettingsDebounced({ window_width: lw, window_height: lh });
         }, 500);
       } catch {
         // 预览模式无窗口对象
@@ -579,6 +601,13 @@ function App() {
     }
   }
 
+  async function loadEarlier() {
+    const next = recordLimit + 366;
+    recordLimitRef.current = next;
+    setRecordLimit(next);
+    await refresh();
+  }
+
   async function clearAllRecords() {
     if (!confirmClear) {
       setConfirmClear(true);
@@ -651,6 +680,24 @@ function App() {
     return merged;
   }
 
+  const pendingSaveRef = useRef<Partial<Settings> | null>(null);
+  const saveTimerRef = useRef<number | null>(null);
+
+  /** 高频输入（文本框/滑块/步进器）用的防抖保存：先更新本地状态，停顿 500ms 后只写一次库 */
+  function updateSettingsDebounced(next: Partial<Settings>): Promise<Settings> {
+    const merged = { ...settingsRef.current, ...next };
+    pendingSaveRef.current = { ...(pendingSaveRef.current ?? {}), ...next };
+    setSettings(merged);
+    if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = window.setTimeout(() => {
+      saveTimerRef.current = null;
+      const payload = pendingSaveRef.current;
+      pendingSaveRef.current = null;
+      if (payload) void updateSettings(payload);
+    }, 500);
+    return Promise.resolve(merged);
+  }
+
   async function finishOnboarding() {
     await updateSettings({ onboarded: true });
     setStatus("已完成首次设置");
@@ -661,6 +708,8 @@ function App() {
     if (!node) return;
     setExportState("exporting");
     try {
+      // 按需加载导出依赖，避免 500KB 级的 html2canvas/jspdf 进首屏包
+      const { toBlob } = await import("html-to-image");
       const bg = window.getComputedStyle(node).backgroundColor || "#ffffff";
       const blob = await toBlob(node, { pixelRatio: 2, cacheBust: true, backgroundColor: bg });
       if (!blob) throw new Error("生成图片失败");
@@ -694,6 +743,7 @@ function App() {
     if (!node) return;
     setExportState("exporting");
     try {
+      const { toBlob } = await import("html-to-image");
       const bg = window.getComputedStyle(node).backgroundColor || "#ffffff";
       const blob = await toBlob(node, { pixelRatio: 2, cacheBust: true, backgroundColor: bg });
       if (!blob) throw new Error("生成图片失败");
@@ -703,6 +753,7 @@ function App() {
         reader.onerror = reject;
         reader.readAsDataURL(blob);
       });
+      const { jsPDF } = await import("jspdf");
       const pdf = new jsPDF({ orientation: "portrait", unit: "pt", format: "a4" });
       const pageW = pdf.internal.pageSize.getWidth();
       const pageH = pdf.internal.pageSize.getHeight();
@@ -827,7 +878,7 @@ function App() {
   }
 
   if (!settings.onboarded) {
-    return <Onboarding settings={settings} onChange={updateSettings} onFinish={finishOnboarding} />;
+    return <Onboarding settings={settings} onChange={updateSettingsDebounced} onFinish={finishOnboarding} />;
   }
 
   return (
@@ -890,6 +941,7 @@ function App() {
               {!isPreview && (
                 <button
                   title={paused ? "恢复记录" : "暂停记录"}
+                  aria-label={paused ? "恢复记录" : "暂停记录"}
                   aria-pressed={paused}
                   className={paused ? "isPaused" : undefined}
                   onClick={toggleRecording}
@@ -897,8 +949,8 @@ function App() {
                   {paused ? <Play size={18} /> : <Pause size={18} />}
                 </button>
               )}
-              <button title="刷新" onClick={refresh}><RefreshCcw size={18} /></button>
-              <button title="导出 CSV" onClick={exportCsv}><Download size={18} /></button>
+              <button title="刷新" aria-label="刷新" onClick={refresh}><RefreshCcw size={18} /></button>
+              <button title="导出 CSV" aria-label="导出 CSV" onClick={exportCsv}><Download size={18} /></button>
             </div>
           )}
         </header>
@@ -920,7 +972,9 @@ function App() {
             <div className="todayStatus">
               <div>
                 <span className="statusDot" />
-                <strong>今日记录正常</strong>
+                <strong className={captureProblem ? "statusProblem" : undefined}>
+                  {captureProblem ? "活动采集异常" : "今日记录正常"}
+                </strong>
               </div>
               <span>
                 {`${isPreview ? "演示数据 · " : ""}${new Date(
@@ -1053,7 +1107,9 @@ function App() {
               <div className="panelTitle">
                 <div>
                   <h2>历史记录</h2>
-                  <p>共 {displayRecords.length} 天，本地保存，可按需同步数据库</p>
+                  <p>
+                    共 {isPreview ? displayRecords.length : totalCount || displayRecords.length} 天，本地保存，可按需同步数据库
+                  </p>
                 </div>
                 {months.length > 1 && (
                   <select
@@ -1172,6 +1228,13 @@ function App() {
                   );
                 })}
               </div>
+              {!isPreview && totalCount > displayRecords.length && (
+                <div className="loadMoreRow">
+                  <button onClick={loadEarlier}>
+                    加载更早记录（还有 {totalCount - displayRecords.length} 天）
+                  </button>
+                </div>
+              )}
             </section>
           </>
         )}
@@ -1179,6 +1242,7 @@ function App() {
         {page === "analytics" && (
           <AnalyticsPage
             records={displayRecords}
+            preview={isPreview}
             settings={settings}
             reportRef={reportRef}
             onExport={handleExport}
@@ -1213,7 +1277,7 @@ function App() {
                   type="text"
                   placeholder="http://127.0.0.1:8787"
                   value={settings.sync_url}
-                  onChange={(event) => updateSettings({ sync_url: event.target.value })}
+                  onChange={(event) => updateSettingsDebounced({ sync_url: event.target.value })}
                 />
               </label>
               <label>
@@ -1222,7 +1286,7 @@ function App() {
                   type="password"
                   placeholder="与服务器端保持一致"
                   value={settings.sync_token}
-                  onChange={(event) => updateSettings({ sync_token: event.target.value })}
+                  onChange={(event) => updateSettingsDebounced({ sync_token: event.target.value })}
                 />
               </label>
               <label>
@@ -1233,7 +1297,7 @@ function App() {
                   max={1440}
                   value={settings.sync_interval_minutes}
                   onChange={(event) =>
-                    updateSettings({ sync_interval_minutes: Number(event.target.value) || 15 })
+                    updateSettingsDebounced({ sync_interval_minutes: Number(event.target.value) || 15 })
                   }
                 />
               </label>
@@ -1285,7 +1349,7 @@ function App() {
                     max="60"
                     value={settings.idle_threshold_minutes}
                     onChange={(event) =>
-                      updateSettings({ idle_threshold_minutes: Number(event.target.value) })
+                      updateSettingsDebounced({ idle_threshold_minutes: Number(event.target.value) })
                     }
                   />
                   <strong>{settings.idle_threshold_minutes} 分钟</strong>
@@ -1387,7 +1451,7 @@ function App() {
                     step={15}
                     value={settings.daily_target_minutes}
                     onChange={(event) =>
-                      updateSettings({ daily_target_minutes: Number(event.target.value) || 0 })
+                      updateSettingsDebounced({ daily_target_minutes: Number(event.target.value) || 0 })
                     }
                   />
                 </label>
@@ -2225,6 +2289,7 @@ function AnalyticsPage({
   onExportPdf,
   exportState,
   exportPath,
+  preview,
 }: {
   records: DailyRecord[];
   settings: Settings;
@@ -2234,10 +2299,12 @@ function AnalyticsPage({
   onExportPdf: () => void;
   exportState: "idle" | "exporting" | "done" | "error";
   exportPath: string;
+  preview: boolean;
 }) {
   const [range, setRange] = useState(7);
   const [hours, setHours] = useState<HourBucket[]>([]);
-  const data = records.length ? records : fallbackRecords;
+  // 演示数据只在浏览器预览模式使用；桌面端零记录就展示空态，绝不编造曲线
+  const data = records.length ? records : preview ? fallbackRecords : [];
   const slice = data.slice(0, range);
   const days = slice.length;
   const useWeeks = days > 14;

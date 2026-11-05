@@ -128,7 +128,8 @@ async fn sync_records(
     authorize(&headers, &state.token)?;
     let conn = state.conn.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let received_at = Local::now().to_rfc3339();
-    let mut accepted = 0usize;
+    // 逐条确认：返回被接受的日期列表，客户端只标记确认过的日期
+    let mut accepted: Vec<String> = Vec::new();
     for record in &payload.records {
         if NaiveDate::parse_from_str(&record.date, "%Y-%m-%d").is_err() {
             continue;
@@ -157,7 +158,7 @@ async fn sync_records(
             ],
         )
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        accepted += 1;
+        accepted.push(record.date.clone());
     }
     Ok(Json(serde_json::json!({ "accepted": accepted })))
 }

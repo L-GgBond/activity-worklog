@@ -55,20 +55,23 @@ impl HttpSyncClient {
             anyhow::bail!("同步服务器返回 {status}: {body}");
         }
 
-        // 服务端可返回 {"accepted": ["2026-11-01", ...]} 逐条确认；
-        // 没给这个字段时按“全部接受”处理，兼容旧服务端。
-        let accepted = serde_json::from_str::<serde_json::Value>(&body)
+        // 服务端应返回 {"accepted": ["2026-11-01", ...]} 逐条确认；
+        // 显式给了该字段就按确认结果标记（哪怕为空，表示全部被拒、保留待同步），
+        // 只有完全没给字段时才按“全部接受”兼容旧服务端。
+        let confirmed = serde_json::from_str::<serde_json::Value>(&body)
             .ok()
-            .and_then(|value| value.get("accepted").and_then(|item| item.as_array()).cloned())
+            .and_then(|value| value.get("accepted").and_then(|item| item.as_array()))
             .map(|items| {
                 items
                     .iter()
                     .filter_map(|item| item.as_str().map(|value| value.to_string()))
                     .collect::<Vec<String>>()
-            })
-            .filter(|list| !list.is_empty());
+            });
 
-        Ok(accepted.unwrap_or(sent))
+        match confirmed {
+            Some(accepted) => Ok(accepted),
+            None => Ok(sent),
+        }
     }
 
     /// 测试连接：GET /api/health，校验 Token 与服务可达性。

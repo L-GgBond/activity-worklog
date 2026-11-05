@@ -2719,3 +2719,33 @@ input[type="range"]::-moz-range-thumb {
     transition: none !important;
   }
 }
+
+/* ============================ 加载更早记录 ============================ */
+
+.loadMoreRow {
+  display: flex;
+  justify-content: center;
+  padding: 12px 0 2px;
+}
+
+.loadMoreRow button {
+  min-height: 34px;
+  padding: 0 14px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--text-dim);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.loadMoreRow button:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+/* 今日面板：采集异常态 */
+
+.statusProblem {
+  color: var(--danger);
+}

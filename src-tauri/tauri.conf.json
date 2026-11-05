@@ -5,7 +5,7 @@
   "identifier": "com.local.activity-worklog",
   "build": {
     "beforeDevCommand": "npm run dev",
-    "devUrl": "http://localhost:1420",
+    "devUrl": "http://localhost:14200",
     "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist"
   },
@@ -24,7 +24,7 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost ws://localhost:14200 ws://127.0.0.1:14200"
     }
   },
   "bundle": {

@@ -56,6 +56,12 @@ impl Store {
             .join("activity-worklog");
         fs::create_dir_all(&data_dir)?;
         let conn = Connection::open(data_dir.join("worklog.sqlite3"))?;
+        // WAL + NORMAL 同步 + 忙等待：后台 15 秒一写时显著减少 fsync 开销，
+        // 也避免极端情况下 UI 读与采集写互相 SQLITE_BUSY
+        let _ = conn.query_row("pragma journal_mode = wal", [], |row| {
+            row.get::<_, String>(0)
+        });
+        conn.execute_batch("pragma synchronous = normal; pragma busy_timeout = 5000;")?;
         let store = Self { conn, data_dir };
         store.migrate()?;
         Ok(store)
@@ -106,7 +112,7 @@ impl Store {
         segments: &mut Vec<ActivitySegment>,
         in_work_session: bool,
         backdate: Option<Duration>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let date = timestamp.format("%Y-%m-%d").to_string();
         let time = timestamp.format("%H:%M:%S").to_string();
         let desired_type = if in_work_session { "work" } else { "away" };
@@ -182,36 +188,79 @@ impl Store {
             }
         }
 
-        // 全量持久化受影响日期的段落，并基于段落重算统计
+        // 全量持久化受影响日期的段落，并基于段落重算统计；
+        // 统计没有变化时跳过写库、不置 pending（返回是否有实际写入）
+        let mut changed = false;
         for affected in &affected_dates {
             self.persist_day_segments(affected, segments)?;
             let stats = segment_stats(segments, affected);
             let updated_at = timestamp.to_rfc3339();
-            self.conn.execute(
-                "
-                insert into daily_work_records
-                    (date, first_activity_at, last_activity_at, active_minutes, idle_minutes, sync_status, updated_at)
-                values
-                    (?1, ?2, ?3, ?5, ?6, 'pending', ?4)
-                on conflict(date) do update set
-                    first_activity_at = coalesce(daily_work_records.first_activity_at, excluded.first_activity_at),
-                    last_activity_at = coalesce(excluded.last_activity_at, daily_work_records.last_activity_at),
-                    active_minutes = excluded.active_minutes,
-                    idle_minutes = excluded.idle_minutes,
-                    sync_status = 'pending',
-                    updated_at = excluded.updated_at
-                ",
-                params![
-                    affected,
-                    stats.first_activity_at,
-                    stats.last_activity_at,
-                    &updated_at,
-                    stats.active_minutes,
-                    stats.idle_minutes
-                ],
-            )?;
+            if self.upsert_daily_stats(affected, &stats, &updated_at)? {
+                changed = true;
+            }
         }
-        Ok(())
+        Ok(changed)
+    }
+
+    /// 写入某天的日统计，返回是否有实际写入：
+    /// 数据没变时跳过，避免「已同步的天被无意义的采样周期反复打回待同步」。
+    fn upsert_daily_stats(
+        &self,
+        date: &str,
+        stats: &DayStats,
+        updated_at: &str,
+    ) -> anyhow::Result<bool> {
+        let existing: Option<(Option<String>, Option<String>, i64, i64)> = self
+            .conn
+            .query_row(
+                "select first_activity_at, last_activity_at, active_minutes, idle_minutes
+                 from daily_work_records where date = ?1",
+                params![date],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .ok();
+
+        if let Some((first, last, active, idle)) = &existing {
+            // 与下方 upsert 的 coalesce 语义保持一致：
+            // 首次活动沿用旧值，最后活动优先用新值
+            let merged_first = first.clone().or_else(|| stats.first_activity_at.clone());
+            let merged_last = stats
+                .last_activity_at
+                .clone()
+                .or_else(|| last.clone());
+            if merged_first == *first
+                && merged_last == *last
+                && stats.active_minutes == *active
+                && stats.idle_minutes == *idle
+            {
+                return Ok(false);
+            }
+        }
+
+        self.conn.execute(
+            "
+            insert into daily_work_records
+                (date, first_activity_at, last_activity_at, active_minutes, idle_minutes, sync_status, updated_at)
+            values
+                (?1, ?2, ?3, ?5, ?6, 'pending', ?4)
+            on conflict(date) do update set
+                first_activity_at = coalesce(daily_work_records.first_activity_at, excluded.first_activity_at),
+                last_activity_at = coalesce(excluded.last_activity_at, daily_work_records.last_activity_at),
+                active_minutes = excluded.active_minutes,
+                idle_minutes = excluded.idle_minutes,
+                sync_status = 'pending',
+                updated_at = excluded.updated_at
+            ",
+            params![
+                date,
+                &stats.first_activity_at,
+                &stats.last_activity_at,
+                updated_at,
+                stats.active_minutes,
+                stats.idle_minutes
+            ],
+        )?;
+        Ok(true)
     }
 
     /// 计算新段落的起点时间：可选回溯到最后输入时刻，但不早于下限（避免段落倒挂）。
@@ -293,29 +342,7 @@ impl Store {
         self.persist_day_segments(&date, segments)?;
         let stats = segment_stats(segments, &date);
         let updated_at = timestamp.to_rfc3339();
-        self.conn.execute(
-            "
-            insert into daily_work_records
-                (date, first_activity_at, last_activity_at, active_minutes, idle_minutes, sync_status, updated_at)
-            values
-                (?1, ?2, ?3, ?5, ?6, 'pending', ?4)
-            on conflict(date) do update set
-                first_activity_at = coalesce(daily_work_records.first_activity_at, excluded.first_activity_at),
-                last_activity_at = coalesce(excluded.last_activity_at, daily_work_records.last_activity_at),
-                active_minutes = excluded.active_minutes,
-                idle_minutes = excluded.idle_minutes,
-                sync_status = 'pending',
-                updated_at = excluded.updated_at
-            ",
-            params![
-                &date,
-                stats.first_activity_at,
-                stats.last_activity_at,
-                &updated_at,
-                stats.active_minutes,
-                stats.idle_minutes
-            ],
-        )?;
+        let _ = self.upsert_daily_stats(&date, &stats, &updated_at)?;
         Ok(())
     }
 
@@ -339,13 +366,38 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    pub fn list_daily_records(&self) -> anyhow::Result<Vec<DailyRecord>> {
+    /// 历史列表：按日期倒序取窗口内的记录（limit 由前端控制，可「加载更早」）
+    pub fn list_daily_records(&self, limit: u32) -> anyhow::Result<Vec<DailyRecord>> {
+        let limit = limit.clamp(1, 5000);
         let mut stmt = self.conn.prepare(
             "
             select date, first_activity_at, last_activity_at, active_minutes, idle_minutes, sync_status
             from daily_work_records
             order by date desc
-            limit 366
+            limit ?1
+            ",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| {
+            Ok(DailyRecord {
+                date: row.get(0)?,
+                first_activity_at: row.get(1)?,
+                last_activity_at: row.get(2)?,
+                active_minutes: row.get(3)?,
+                idle_minutes: row.get(4)?,
+                sync_status: row.get(5)?,
+            })
+        })?;
+
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// 全量列表（CSV 导出用），不受历史列表窗口限制
+    pub fn list_all_daily_records(&self) -> anyhow::Result<Vec<DailyRecord>> {
+        let mut stmt = self.conn.prepare(
+            "
+            select date, first_activity_at, last_activity_at, active_minutes, idle_minutes, sync_status
+            from daily_work_records
+            order by date desc
             ",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -360,6 +412,17 @@ impl Store {
         })?;
 
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// 历史总天数
+    pub fn count_daily_records(&self) -> anyhow::Result<i64> {
+        self.conn
+            .query_row(
+                "select count(1) from daily_work_records",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
     }
 
     pub fn pending_records(&self) -> anyhow::Result<Vec<DailyRecord>> {
@@ -425,9 +488,13 @@ impl Store {
             .map(|base| base.join("Activity Worklog"))
             .unwrap_or_else(|| self.data_dir.clone());
         fs::create_dir_all(&dir)?;
-        let path = dir.join("daily-work-records.csv");
+        // 带时间戳，避免静默覆盖上一次导出；走全量查询，不受历史列表窗口限制
+        let path = dir.join(format!(
+            "daily-work-records-{}.csv",
+            Local::now().format("%Y%m%d-%H%M%S")
+        ));
         let mut writer = csv::Writer::from_path(&path)?;
-        for record in self.list_daily_records()? {
+        for record in self.list_all_daily_records()? {
             writer.serialize(record)?;
         }
         writer.flush()?;
@@ -554,15 +621,15 @@ impl Store {
     }
 }
 
-struct DayStats {
-    first_activity_at: Option<String>,
-    last_activity_at: Option<String>,
-    active_minutes: i64,
-    idle_minutes: i64,
+pub struct DayStats {
+    pub first_activity_at: Option<String>,
+    pub last_activity_at: Option<String>,
+    pub active_minutes: i64,
+    pub idle_minutes: i64,
 }
 
 /// 基于段落数据重算某天的统计数据（按秒累计，彻底修复分钟数恒为 0 的问题）。
-fn segment_stats(segments: &[ActivitySegment], date: &str) -> DayStats {
+pub fn segment_stats(segments: &[ActivitySegment], date: &str) -> DayStats {
     let mut first_activity_at: Option<String> = None;
     let mut last_activity_at: Option<String> = None;
     let mut active_seconds: i64 = 0;

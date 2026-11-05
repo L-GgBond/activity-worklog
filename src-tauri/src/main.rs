@@ -3,13 +3,13 @@ mod db;
 mod settings;
 mod sync;
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use activity::InputActivityProbe;
 use chrono::{Local, TimeZone};
-use db::{ActivitySegment, DailyRecord, HourBucket, Store, SyncSummary};
+use db::{segment_stats, ActivitySegment, DailyRecord, HourBucket, Store, SyncSummary};
 use settings::AppSettings;
 use sync::HttpSyncClient;
 use tauri::menu::{Menu, MenuItem, MenuItemKind};
@@ -26,8 +26,8 @@ use argon2::Argon2;
 struct AppState {
     store: Mutex<Store>,
     paused: AtomicBool,
-    /// 记录被清空/删除后置位，采集循环据此丢弃内存缓冲，避免下一 tick 又写回
-    resetting: AtomicBool,
+    /// 采集缓冲重置标记：1 = 清空重来（删除/清空记录后），2 = 以数据库为准重新加载（恢复备份后）
+    resetting: AtomicU8,
     /// 应用锁：未解锁时所有读数据的命令都会被拒绝
     unlocked: AtomicBool,
     failed_unlocks: AtomicU32,
@@ -50,6 +50,48 @@ fn ensure_unlocked(state: &State<AppState>) -> Result<(), String> {
         Ok(())
     } else {
         Err("应用已锁定，请先解锁".into())
+    }
+}
+
+/// 应用锁认证的统一限流参数
+const AUTH_MAX_FAILS: u32 = 5;
+const AUTH_COOLDOWN_SECS: u64 = 60;
+
+impl AppState {
+    /// 所有需要校验密码/恢复码的命令共用同一套冷却检查，
+    /// 避免 unlock 限流但 set_password / disable_lock 不限流被绕过。
+    fn check_auth_cooldown(&self) -> Result<(), String> {
+        if let Some(until) = *self
+            .cooldown_until
+            .lock()
+            .map_err(|_| "state lock failed".to_string())?
+        {
+            if Instant::now() < until {
+                let left = (until - Instant::now()).as_secs() + 1;
+                return Err(format!("尝试次数过多，请 {left} 秒后再试"));
+            }
+        }
+        Ok(())
+    }
+
+    /// 记一次认证失败；达到阈值时进入冷却，返回要展示给前端的错误信息
+    fn register_auth_failure(&self, label: &str) -> String {
+        let fails = self.failed_unlocks.fetch_add(1, Ordering::Relaxed) + 1;
+        if fails >= AUTH_MAX_FAILS {
+            self.failed_unlocks.store(0, Ordering::Relaxed);
+            if let Ok(mut until) = self.cooldown_until.lock() {
+                *until = Some(Instant::now() + Duration::from_secs(AUTH_COOLDOWN_SECS));
+            }
+            return "认证连续失败 5 次，请 60 秒后再试".to_string();
+        }
+        format!("{label}，还可尝试 {} 次", AUTH_MAX_FAILS - fails)
+    }
+
+    fn clear_auth_failures(&self) {
+        self.failed_unlocks.store(0, Ordering::Relaxed);
+        if let Ok(mut until) = self.cooldown_until.lock() {
+            *until = None;
+        }
     }
 }
 
@@ -89,13 +131,28 @@ fn generate_recovery_code() -> String {
 }
 
 #[tauri::command]
-fn list_daily_records(state: State<AppState>) -> Result<Vec<DailyRecord>, String> {
+fn list_daily_records(
+    state: State<AppState>,
+    limit: Option<u32>,
+) -> Result<Vec<DailyRecord>, String> {
     ensure_unlocked(&state)?;
     state
         .store
         .lock()
         .map_err(|_| "store lock failed".to_string())?
-        .list_daily_records()
+        .list_daily_records(limit.unwrap_or(366))
+        .map_err(|err| err.to_string())
+}
+
+/// 历史总天数：配合 list_daily_records 的窗口做「加载更早」
+#[tauri::command]
+fn count_daily_records(state: State<AppState>) -> Result<i64, String> {
+    ensure_unlocked(&state)?;
+    state
+        .store
+        .lock()
+        .map_err(|_| "store lock failed".to_string())?
+        .count_daily_records()
         .map_err(|err| err.to_string())
 }
 
@@ -112,12 +169,16 @@ fn list_segments(state: State<AppState>, date: String) -> Result<Vec<ActivitySeg
 
 #[tauri::command]
 fn get_settings(state: State<AppState>) -> Result<AppSettings, String> {
-    state
+    let mut settings = state
         .store
         .lock()
         .map_err(|_| "store lock failed".to_string())?
         .get_settings()
-        .map_err(|err| err.to_string())
+        .map_err(|err| err.to_string())?;
+    // 密码/恢复码哈希不下发到前端；保存时由 save_settings 沿用库里的值
+    settings.password_hash.clear();
+    settings.recovery_hash.clear();
+    Ok(settings)
 }
 
 #[tauri::command]
@@ -127,11 +188,16 @@ fn save_settings(
     state: State<AppState>,
 ) -> Result<(), String> {
     ensure_unlocked(&state)?;
+    // 自启注册失败不应阻断设置保存（例如系统目录不可写）：
+    // 先尽力同步自启状态并记录，再照常落库，下次保存会重试。
     let autostart = app.autolaunch();
-    if settings.autostart_enabled {
-        autostart.enable().map_err(|err| err.to_string())?;
+    let autostart_result = if settings.autostart_enabled {
+        autostart.enable()
     } else {
-        autostart.disable().map_err(|err| err.to_string())?;
+        autostart.disable()
+    };
+    if let Err(err) = autostart_result {
+        eprintln!("同步开机自启状态失败: {err}");
     }
 
     // 前端不持有密码哈希，保存时必须沿用库里已有的值，
@@ -163,7 +229,7 @@ fn delete_day(app: AppHandle, state: State<AppState>, date: String) -> Result<()
         .map_err(|err| err.to_string())?;
     // 删的是今天时，采集循环内存里还留着当天段落，需要让它重新开始
     if date == Local::now().format("%Y-%m-%d").to_string() {
-        state.resetting.store(true, Ordering::Relaxed);
+        state.resetting.store(1, Ordering::Relaxed);
     }
     let _ = app.emit("records-updated", ());
     Ok(())
@@ -178,7 +244,7 @@ fn clear_all_records(app: AppHandle, state: State<AppState>) -> Result<String, S
         .map_err(|_| "store lock failed".to_string())?
         .clear_records()
         .map_err(|err| err.to_string())?;
-    state.resetting.store(true, Ordering::Relaxed);
+    state.resetting.store(1, Ordering::Relaxed);
     let _ = app.emit("records-updated", ());
     Ok(format!("已清除 {removed} 天记录"))
 }
@@ -256,13 +322,18 @@ async fn restore_db(app: AppHandle) -> Result<String, String> {
             return Err("未选择文件".into());
         }
         let state = app.state::<AppState>();
-        let mut store = state
-            .store
-            .lock()
-            .map_err(|_| "store lock failed".to_string())?;
-        store
-            .restore_from(std::path::Path::new(&src))
-            .map_err(|err| err.to_string())?;
+        {
+            let mut store = state
+                .store
+                .lock()
+                .map_err(|_| "store lock failed".to_string())?;
+            store
+                .restore_from(std::path::Path::new(&src))
+                .map_err(|err| err.to_string())?;
+        }
+        // 恢复后以数据库为准：让采集循环重新加载当天段落，
+        // 否则内存里的旧段落会在下一个采样周期把恢复结果覆盖掉
+        state.resetting.store(2, Ordering::Relaxed);
         Ok("已从备份恢复，列表已刷新".into())
     }
 
@@ -324,11 +395,16 @@ async fn check_update(app: AppHandle) -> Result<UpdateInfo, String> {
 }
 
 /// 通过 macOS 系统通知提示（无需额外通知插件，复用 shell 调用 osascript）。
+#[cfg(target_os = "macos")]
 fn notify_macos(app: &AppHandle, message: &str) {
     let safe = message.replace('"', "'");
     let script = format!("display notification \"{}\" with title \"Activity Worklog\"", safe);
     let _ = app.shell().command("osascript").args(["-e", &script]).spawn();
 }
+
+/// 非 macOS 暂无系统通知通道（Windows 待接入 tauri-plugin-notification），静默跳过。
+#[cfg(not(target_os = "macos"))]
+fn notify_macos(_app: &AppHandle, _message: &str) {}
 
 /// 立即把待同步记录推一次，不等定时器。
 #[tauri::command]
@@ -359,13 +435,15 @@ async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<String, 
         return Ok("没有待同步的记录".into());
     }
 
-    let dates: Vec<String> = pending.iter().map(|record| record.date.clone()).collect();
     let client = HttpSyncClient::new();
     let accepted = client
         .push_records(&settings, pending)
         .await
         .map_err(|err| err.to_string())?;
-    let synced = if accepted.is_empty() { dates } else { accepted };
+    if accepted.is_empty() {
+        // 服务端逐条确认但 0 条被接受：保留 pending，等待下轮重试
+        return Ok("服务器未确认任何记录，已保留待同步".into());
+    }
 
     {
         let store = state
@@ -373,11 +451,11 @@ async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<String, 
             .lock()
             .map_err(|_| "store lock failed".to_string())?;
         store
-            .mark_synced(&synced)
+            .mark_synced(&accepted)
             .map_err(|err| err.to_string())?;
     }
     let _ = app.emit("records-updated", ());
-    Ok(format!("已同步 {} 天记录", synced.len()))
+    Ok(format!("已同步 {} 天记录", accepted.len()))
 }
 
 /// 把用户输入的恢复码归一化：忽略大小写、横线与空格，统一成 4 位一组
@@ -412,16 +490,7 @@ fn auth_state(state: State<AppState>) -> AuthState {
 
 #[tauri::command]
 fn unlock(app: AppHandle, state: State<AppState>, password: String) -> Result<(), String> {
-    if let Some(until) = *state
-        .cooldown_until
-        .lock()
-        .map_err(|_| "state lock failed".to_string())?
-    {
-        if Instant::now() < until {
-            let left = (until - Instant::now()).as_secs() + 1;
-            return Err(format!("尝试次数过多，请 {left} 秒后再试"));
-        }
-    }
+    state.check_auth_cooldown()?;
 
     let phc = state
         .store
@@ -437,27 +506,13 @@ fn unlock(app: AppHandle, state: State<AppState>, password: String) -> Result<()
     }
 
     if verify_secret(&password, &phc) {
-        state.failed_unlocks.store(0, Ordering::Relaxed);
-        *state
-            .cooldown_until
-            .lock()
-            .map_err(|_| "state lock failed".to_string())? = None;
+        state.clear_auth_failures();
         state.unlocked.store(true, Ordering::Relaxed);
         let _ = app.emit("unlocked", ());
         return Ok(());
     }
 
-    let fails = state.failed_unlocks.fetch_add(1, Ordering::Relaxed) + 1;
-    if fails >= 5 {
-        state.failed_unlocks.store(0, Ordering::Relaxed);
-        *state
-            .cooldown_until
-            .lock()
-            .map_err(|_| "state lock failed".to_string())? =
-            Some(Instant::now() + Duration::from_secs(60));
-        return Err("密码连续错误 5 次，请 60 秒后再试".into());
-    }
-    Err(format!("密码不正确，还可尝试 {} 次", 5 - fails))
+    Err(state.register_auth_failure("密码不正确"))
 }
 
 #[tauri::command]
@@ -473,6 +528,7 @@ fn lock(app: AppHandle, state: State<AppState>) -> Result<(), String> {
 /// 设置或修改密码，返回一次性恢复码（只在此处返回，之后只存哈希）
 #[tauri::command]
 fn set_password(state: State<AppState>, current: String, next: String) -> Result<String, String> {
+    state.check_auth_cooldown()?;
     let next = next.trim().to_string();
     if next.chars().count() < 6 {
         return Err("密码至少 6 位".into());
@@ -486,7 +542,7 @@ fn set_password(state: State<AppState>, current: String, next: String) -> Result
         .map_err(|err| err.to_string())?;
 
     if !settings.password_hash.is_empty() && !verify_secret(&current, &settings.password_hash) {
-        return Err("当前密码不正确".into());
+        return Err(state.register_auth_failure("当前密码不正确"));
     }
 
     let recovery = generate_recovery_code();
@@ -498,12 +554,14 @@ fn set_password(state: State<AppState>, current: String, next: String) -> Result
         .map_err(|_| "store lock failed".to_string())?
         .save_settings(&settings)
         .map_err(|err| err.to_string())?;
+    state.clear_auth_failures();
     state.unlocked.store(true, Ordering::Relaxed);
     Ok(recovery)
 }
 
 #[tauri::command]
 fn disable_lock(state: State<AppState>, current: String) -> Result<(), String> {
+    state.check_auth_cooldown()?;
     let mut settings = state
         .store
         .lock()
@@ -514,7 +572,7 @@ fn disable_lock(state: State<AppState>, current: String) -> Result<(), String> {
         return Ok(());
     }
     if !verify_secret(&current, &settings.password_hash) {
-        return Err("密码不正确".into());
+        return Err(state.register_auth_failure("密码不正确"));
     }
     settings.password_hash.clear();
     settings.recovery_hash.clear();
@@ -524,6 +582,7 @@ fn disable_lock(state: State<AppState>, current: String) -> Result<(), String> {
         .map_err(|_| "store lock failed".to_string())?
         .save_settings(&settings)
         .map_err(|err| err.to_string())?;
+    state.clear_auth_failures();
     state.unlocked.store(true, Ordering::Relaxed);
     Ok(())
 }
@@ -535,6 +594,7 @@ fn reset_password_with_recovery(
     code: String,
     next: String,
 ) -> Result<String, String> {
+    state.check_auth_cooldown()?;
     let next = next.trim().to_string();
     if next.chars().count() < 6 {
         return Err("密码至少 6 位".into());
@@ -551,7 +611,7 @@ fn reset_password_with_recovery(
         return Err("没有可用的恢复码".into());
     }
     if !verify_secret(&normalize_code(&code), &settings.recovery_hash) {
-        return Err("恢复码不正确".into());
+        return Err(state.register_auth_failure("恢复码不正确"));
     }
 
     let recovery = generate_recovery_code();
@@ -563,6 +623,7 @@ fn reset_password_with_recovery(
         .map_err(|_| "store lock failed".to_string())?
         .save_settings(&settings)
         .map_err(|err| err.to_string())?;
+    state.clear_auth_failures();
     state.unlocked.store(true, Ordering::Relaxed);
     Ok(recovery)
 }
@@ -601,10 +662,32 @@ fn toggle_pause(state: State<AppState>) -> Result<bool, String> {
 /// ext 为扩展名（不含点），如 "png" / "pdf"。
 #[tauri::command]
 fn export_report(filename: String, data: Vec<u8>, ext: String) -> Result<String, String> {
+    // 文件名/扩展名来自前端，这里做白名单清洗，防止路径穿越
+    let safe_name: String = filename
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.' | '·') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim()
+        .to_string();
+    let safe_name = if safe_name.is_empty() {
+        "report".to_string()
+    } else {
+        safe_name
+    };
+    let ext = ext.trim().trim_start_matches('.').to_lowercase();
+    if !["png", "pdf", "jpg", "csv"].contains(&ext.as_str()) {
+        return Err("不支持的导出格式".into());
+    }
     let base = dirs::download_dir().ok_or_else(|| "无法定位下载目录".to_string())?;
     let dir = base.join("Activity Worklog");
     std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
-    let path = dir.join(format!("{}.{}", filename, ext.trim_start_matches('.')));
+    let path = dir.join(format!("{safe_name}.{ext}"));
     std::fs::write(&path, &data).map_err(|err| err.to_string())?;
     Ok(path.to_string_lossy().to_string())
 }
@@ -735,10 +818,24 @@ fn spawn_activity_loop(app: AppHandle) {
                 .and_then(|store| store.get_settings().ok())
                 .unwrap_or_default();
 
-            // 用户清空/删除记录后，丢弃内存里的当天段落，避免下一 tick 又写回去
-            if state.resetting.swap(false, Ordering::Relaxed) {
-                segments.clear();
-                continue;
+            // 采集缓冲重置：1 = 清空重来（删除/清空记录），2 = 以数据库为准重新加载（恢复备份）
+            match state.resetting.swap(0, Ordering::Relaxed) {
+                1 => {
+                    segments.clear();
+                    continue;
+                }
+                2 => {
+                    if let Ok(store) = state.store.lock() {
+                        match store.load_segments_for_today() {
+                            Ok(loaded) => segments = loaded,
+                            Err(_) => segments.clear(),
+                        }
+                    } else {
+                        segments.clear();
+                    }
+                    continue;
+                }
+                _ => {}
             }
 
             let idle_for = match probe.idle_duration() {
@@ -780,31 +877,29 @@ fn spawn_activity_loop(app: AppHandle) {
             // 新段落起点回溯到最后一次真实输入时刻（now - idle_for）
             let backdate = Some(idle_for);
 
-            if let Ok(mut store) = state.store.lock() {
-                let _ = store.record_activity(now, &mut segments, in_work_session, backdate);
-            }
-            let _ = app.emit("records-updated", ());
-
-            // 实时更新托盘 tooltip 为今日活跃占比
-            if let Ok(store) = state.store.lock() {
-                if let Ok(records) = store.list_daily_records() {
-                    let today = Local::now().format("%Y-%m-%d").to_string();
-                    if let Some(t) = records.iter().find(|r| r.date == today) {
-                        let total = t.active_minutes + t.idle_minutes;
-                        let pct = if total > 0 {
-                            (t.active_minutes * 100 / total) as u32
-                        } else {
-                            0
-                        };
-                        if let Some(tray) = app.tray_by_id("main") {
-                            let _ = tray.set_tooltip(Some(format!(
-                                "Activity Worklog · 今日活跃 {}%",
-                                pct
-                            )));
-                        }
-                    }
-                }
+            let day_changed = match state.store.lock() {
+                Ok(mut store) => store
+                    .record_activity(now, &mut segments, in_work_session, backdate)
+                    .unwrap_or(false),
+                Err(_) => false,
             };
+            // 只有当天统计真的变化时才通知前端刷新
+            if day_changed {
+                let _ = app.emit("records-updated", ());
+            }
+
+            // 托盘 tooltip 直接用内存段落计算今日活跃占比，不再每个采样周期查一遍库
+            let today = now.format("%Y-%m-%d").to_string();
+            let stats = segment_stats(&segments, &today);
+            let total = stats.active_minutes + stats.idle_minutes;
+            let pct = if total > 0 {
+                ((stats.active_minutes * 100) / total) as u32
+            } else {
+                0
+            };
+            if let Some(tray) = app.tray_by_id("main") {
+                let _ = tray.set_tooltip(Some(format!("Activity Worklog · 今日活跃 {pct}%")));
+            }
         }
     });
 }
@@ -854,18 +949,23 @@ fn spawn_sync_loop(app: AppHandle) {
                 continue;
             }
 
-            let dates: Vec<String> = pending.iter().map(|record| record.date.clone()).collect();
             match client.push_records(&settings, pending).await {
                 Ok(accepted) => {
-                    // 服务端逐条确认时只标记确认过的日期，避免“假已同步”
-                    let synced_dates = if accepted.is_empty() { dates } else { accepted };
-                    let state = app.state::<AppState>();
-                    if let Ok(store) = state.store.lock() {
-                        let _ = store.mark_synced(&synced_dates);
+                    if accepted.is_empty() {
+                        // 服务端逐条确认但 0 条被接受：保留 pending，短期退避后重试
+                        next_sync_at = Some(std::time::Instant::now() + Duration::from_secs(60));
+                    } else {
+                        // 只标记服务端确认过的日期，避免“假已同步”
+                        let state = app.state::<AppState>();
+                        if let Ok(store) = state.store.lock() {
+                            let _ = store.mark_synced(&accepted);
+                        }
+                        let _ = app.emit("records-updated", ());
                     }
-                    let _ = app.emit("records-updated", ());
                 }
                 Err(err) => {
+                    // 失败退避：1 分钟后重试，不等满一个同步周期
+                    next_sync_at = Some(std::time::Instant::now() + Duration::from_secs(60));
                     let _ = app.emit("sync-error", err.to_string());
                 }
             }
@@ -910,7 +1010,7 @@ fn main() {
             app.manage(AppState {
                 store: Mutex::new(store),
                 paused: AtomicBool::new(false),
-                resetting: AtomicBool::new(false),
+                resetting: AtomicU8::new(0),
                 unlocked: AtomicBool::new(!locked),
                 failed_unlocks: AtomicU32::new(0),
                 cooldown_until: Mutex::new(None),
@@ -943,6 +1043,7 @@ fn main() {
             disable_lock,
             reset_password_with_recovery,
             list_daily_records,
+            count_daily_records,
             list_segments,
             delete_day,
             clear_all_records,
