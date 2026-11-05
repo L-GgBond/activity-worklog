@@ -1,0 +1,92 @@
+name: CI
+
+# 每次推 main 或提 PR 都跑一遍；避免只在打 tag 发布时才发现编译不过。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: 前端类型检查与构建
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Build
+        run: npm run build
+
+  desktop:
+    name: Tauri 后端检查（macOS）
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Check
+        run: cargo check --manifest-path src-tauri/Cargo.toml --locked
+
+      - name: Test
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+
+      - name: Clippy
+        # 暂不加 -D warnings：现有代码还有历史 warning，清理完再收紧
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked
+
+  server:
+    name: 同步服务端检查与单测
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./server -> server/target"
+
+      # server/ 未提交 Cargo.lock，这里不用 --locked
+      - name: Check
+        run: cargo check --manifest-path server/Cargo.toml
+
+      - name: Test
+        run: cargo test --manifest-path server/Cargo.toml
+
+      - name: Clippy
+        run: cargo clippy --manifest-path server/Cargo.toml

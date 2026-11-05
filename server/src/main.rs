@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use axum::extract::State;
@@ -76,30 +76,36 @@ fn load_or_create_token() -> anyhow::Result<String> {
     if let Ok(existing) = fs::read_to_string(&token_path) {
         let trimmed = existing.trim();
         if !trimmed.is_empty() {
+            // 兼容早期生成、权限可能过宽的 Token 文件，顺手收紧
+            restrict_token_file(&token_path)?;
             return Ok(trimmed.to_string());
         }
     }
     let token = generate_token()?;
     fs::write(&token_path, &token)?;
+    restrict_token_file(&token_path)?;
     Ok(token)
 }
 
+/// 32 字节全部来自系统 CSPRNG（Windows 走 BCryptGenRandom，Unix 走 getrandom(2)）。
+/// 取不到随机源时直接让服务启动失败，绝不退回「时间戳哈希」这种可预测值。
 fn generate_token() -> anyhow::Result<String> {
-    // 优先从系统随机源取 16 字节，失败时回退到时间+进程哈希
-    if let Ok(mut file) = fs::File::open("/dev/urandom") {
-        use std::io::Read;
-        let mut buf = [0u8; 16];
-        if file.read_exact(&mut buf).is_ok() {
-            return Ok(buf.iter().map(|byte| format!("{byte:02x}")).collect());
-        }
-    }
-    let now = Local::now();
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in now.to_rfc3339().bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    Ok(format!("tok-{hash:016x}"))
+    let mut buf = [0u8; 32];
+    getrandom::getrandom(&mut buf)
+        .map_err(|err| anyhow::anyhow!("系统随机源不可用：{err}"))?;
+    Ok(buf.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// Token 文件仅当前用户可读写（Unix）。Windows 用户配置目录默认已只有本人可访问。
+#[cfg(unix)]
+fn restrict_token_file(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn restrict_token_file(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 fn authorize(headers: &HeaderMap, token: &str) -> Result<(), StatusCode> {
@@ -394,4 +400,65 @@ async fn main() {
         .await
         .expect("端口 8787 被占用");
     axum::serve(listener, app).await.expect("服务启动失败");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn token_uses_system_csprng() {
+        let first = generate_token().unwrap();
+        let second = generate_token().unwrap();
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(first, second, "两次生成的 Token 不能相同");
+    }
+
+    #[test]
+    fn authorize_only_accepts_matching_token() {
+        let mut headers = HeaderMap::new();
+        assert!(authorize(&headers, "secret").is_err());
+        headers.insert("authorization", HeaderValue::from_static("Bearer secret"));
+        assert!(authorize(&headers, "secret").is_ok());
+        assert!(authorize(&headers, "other").is_err());
+        headers.insert("authorization", HeaderValue::from_static("Bearer "));
+        assert!(authorize(&headers, "secret").is_err());
+    }
+
+    #[test]
+    fn iso_week_uses_iso_calendar_year() {
+        assert_eq!(iso_week_key("2025-12-29"), "2026-W01");
+        assert_eq!(iso_week_key("2026-01-01"), "2026-W01");
+        assert_eq!(iso_week_key("not-a-date"), "not-a-date");
+    }
+
+    #[test]
+    fn aggregate_groups_rows_by_period() {
+        let rows: Vec<(String, Option<String>, Option<String>, i64, i64)> = vec![
+            (
+                "2026-01-05".to_string(),
+                Some("09:00".to_string()),
+                Some("18:00".to_string()),
+                100,
+                10,
+            ),
+            (
+                "2026-01-06".to_string(),
+                Some("08:30".to_string()),
+                Some("17:00".to_string()),
+                200,
+                20,
+            ),
+        ];
+        let result = aggregate_by_period(rows, |date| date[..7].to_string());
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].period, "2026-01");
+        assert_eq!(result[0].days, 2);
+        assert_eq!(result[0].active_minutes, 300);
+        assert_eq!(result[0].idle_minutes, 30);
+        assert_eq!(result[0].first_activity_at.as_deref(), Some("08:30"));
+        assert_eq!(result[0].last_activity_at.as_deref(), Some("18:00"));
+    }
 }

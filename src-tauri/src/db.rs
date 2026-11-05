@@ -49,6 +49,28 @@ pub struct Store {
     data_dir: PathBuf,
 }
 
+/// WAL + NORMAL 同步 + 忙等待：后台 15 秒一写时显著减少 fsync 开销，
+/// 也避免极端情况下 UI 读与采集写互相 SQLITE_BUSY。
+/// 这些是「连接级」设置，不跟随数据库文件；恢复备份重开连接后必须重新执行一遍。
+fn configure_connection(conn: &Connection) -> anyhow::Result<()> {
+    let _ = conn.query_row("pragma journal_mode = wal", [], |row| {
+        row.get::<_, String>(0)
+    });
+    conn.execute_batch("pragma synchronous = normal; pragma busy_timeout = 5000;")?;
+    Ok(())
+}
+
+/// SQLite 的 -wal / -shm 伴随文件路径。用 OsString 拼接，
+/// 避免数据目录含非 ASCII 字符时 to_string_lossy() 把路径改写掉。
+fn wal_sidecar(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut name = db_path
+        .file_name()
+        .map(|value| value.to_os_string())
+        .unwrap_or_default();
+    name.push(suffix);
+    db_path.with_file_name(name)
+}
+
 impl Store {
     pub fn open() -> anyhow::Result<Self> {
         let data_dir = dirs::data_local_dir()
@@ -56,12 +78,7 @@ impl Store {
             .join("activity-worklog");
         fs::create_dir_all(&data_dir)?;
         let conn = Connection::open(data_dir.join("worklog.sqlite3"))?;
-        // WAL + NORMAL 同步 + 忙等待：后台 15 秒一写时显著减少 fsync 开销，
-        // 也避免极端情况下 UI 读与采集写互相 SQLITE_BUSY
-        let _ = conn.query_row("pragma journal_mode = wal", [], |row| {
-            row.get::<_, String>(0)
-        });
-        conn.execute_batch("pragma synchronous = normal; pragma busy_timeout = 5000;")?;
+        configure_connection(&conn)?;
         let store = Self { conn, data_dir };
         store.migrate()?;
         Ok(store)
@@ -562,26 +579,42 @@ impl Store {
         Ok(())
     }
 
-    /// 用备份文件替换当前数据库：先校验备份可用，再断开旧句柄、覆盖、重开。
-    /// 直接覆盖运行中的数据库文件会让后续写入落进已被替换的旧 inode。
+    /// 用备份文件替换当前数据库：校验 → 归一化快照 → 断开旧句柄 → 清理 WAL → 覆盖 → 重开。
+    ///
+    /// 两个必须处理的坑：
+    /// 1. 直接覆盖运行中的库文件，旧句柄后续写入会落进已被替换的旧 inode；
+    /// 2. 开启 WAL 后强杀进程会残留 -wal / -shm，只覆盖主库的话新连接会 replay
+    ///    旧事务，把刚恢复的数据又改回去。
     pub fn restore_from(&mut self, source: &Path) -> anyhow::Result<()> {
         if !source.exists() {
             anyhow::bail!("备份文件不存在");
         }
+        let target = self.db_path();
+        let staged = self.data_dir.join("worklog.restore.tmp");
         {
+            // 校验表结构，同时用 VACUUM INTO 生成不含 WAL 的干净快照。
+            // 若备份是直接拷贝的主库且旁边带着 -wal，这一步会把 WAL 里的事务一并固化进快照。
             let probe = Connection::open(source)?;
             probe.query_row("select count(1) from daily_work_records", [], |row| {
                 row.get::<_, i64>(0)
             })?;
+            if staged.exists() {
+                fs::remove_file(&staged)?;
+            }
+            probe.execute(
+                "vacuum into ?1",
+                params![staged.to_string_lossy().to_string()],
+            )?;
         }
-        let target = self.db_path();
-        let staged = self.data_dir.join("worklog.restore.tmp");
-        fs::copy(source, &staged)?;
-        // 先换成内存库释放文件句柄，再覆盖，最后重开
+        // probe 已释放；先换成内存库释放主库句柄（正常关闭时 SQLite 会自行 checkpoint）
         self.conn = Connection::open_in_memory()?;
+        // 无论上次是正常退出还是强杀，都清掉残留伴随文件再覆盖
+        let _ = fs::remove_file(wal_sidecar(&target, "-wal"));
+        let _ = fs::remove_file(wal_sidecar(&target, "-shm"));
         fs::copy(&staged, &target)?;
         let _ = fs::remove_file(&staged);
         self.conn = Connection::open(&target)?;
+        configure_connection(&self.conn)?;
         self.migrate()?;
         Ok(())
     }
@@ -674,4 +707,59 @@ fn parse_time_seconds(time: &str) -> i64 {
             parsed.hour() as i64 * 3600 + parsed.minute() as i64 * 60 + parsed.second() as i64
         })
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn segment(date: &str, start: &str, end: &str, kind: &str) -> ActivitySegment {
+        ActivitySegment {
+            date: date.to_string(),
+            started_at: start.to_string(),
+            ended_at: end.to_string(),
+            segment_type: kind.to_string(),
+        }
+    }
+
+    #[test]
+    fn segment_stats_only_counts_requested_date() {
+        let segments = vec![
+            segment("2026-01-05", "09:00:00", "10:30:00", "work"),
+            segment("2026-01-05", "10:30:00", "10:45:00", "away"),
+            segment("2026-01-06", "09:00:00", "12:00:00", "work"),
+        ];
+        let stats = segment_stats(&segments, "2026-01-05");
+        assert_eq!(stats.active_minutes, 90);
+        assert_eq!(stats.idle_minutes, 15);
+        assert_eq!(stats.first_activity_at.as_deref(), Some("09:00:00"));
+        assert_eq!(stats.last_activity_at.as_deref(), Some("10:30:00"));
+    }
+
+    #[test]
+    fn segment_stats_handles_open_and_reversed_segments() {
+        let segments = vec![
+            segment("2026-01-05", "09:00:00", "", "work"),
+            segment("2026-01-05", "11:00:00", "10:00:00", "away"),
+        ];
+        let stats = segment_stats(&segments, "2026-01-05");
+        assert_eq!(stats.active_minutes, 0);
+        assert_eq!(stats.idle_minutes, 0);
+        assert_eq!(stats.last_activity_at.as_deref(), Some("09:00:00"));
+    }
+
+    #[test]
+    fn parse_time_seconds_handles_clock_and_garbage() {
+        assert_eq!(parse_time_seconds("23:59:59"), 86_399);
+        assert_eq!(parse_time_seconds("bad"), 0);
+    }
+
+    #[test]
+    fn wal_sidecar_keeps_non_ascii_path_intact() {
+        let path = PathBuf::from("数据目录").join("worklog.sqlite3");
+        assert_eq!(
+            wal_sidecar(&path, "-wal"),
+            PathBuf::from("数据目录").join("worklog.sqlite3-wal")
+        );
+    }
 }

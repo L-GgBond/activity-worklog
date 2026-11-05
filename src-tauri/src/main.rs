@@ -3,9 +3,10 @@ mod db;
 mod settings;
 mod sync;
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use activity::InputActivityProbe;
 use chrono::{Local, TimeZone};
@@ -32,6 +33,8 @@ struct AppState {
     unlocked: AtomicBool,
     failed_unlocks: AtomicU32,
     cooldown_until: Mutex<Option<Instant>>,
+    /// 认证节流状态的落盘位置（重启后仍能续上冷却）
+    auth_throttle_path: PathBuf,
 }
 
 /// 是否设置了应用锁密码
@@ -50,6 +53,51 @@ fn ensure_unlocked(state: &State<AppState>) -> Result<(), String> {
         Ok(())
     } else {
         Err("应用已锁定，请先解锁".into())
+    }
+}
+
+/// 认证节流状态落盘：失败次数与冷却截止时间不能只放内存，
+/// 否则重启应用就能绕开 5 次失败后的 60 秒冷却。
+/// 单独放数据目录的小 JSON，不写进数据库（恢复备份时不应被业务数据覆盖）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
+struct AuthThrottle {
+    failed_attempts: u32,
+    /// Unix 秒；0 表示当前不在冷却中
+    cooldown_until_unix: i64,
+}
+
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn read_auth_throttle(path: &Path) -> AuthThrottle {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<AuthThrottle>(&text).ok())
+        .unwrap_or_default()
+}
+
+/// 尽力而为地写盘：磁盘不可写时只退化为「重启后重置计数」，不阻断解锁流程。
+fn write_auth_throttle(path: &Path, failed_attempts: u32, cooldown: Option<Instant>) {
+    let cooldown_until_unix = match cooldown {
+        Some(until) => until
+            .checked_duration_since(Instant::now())
+            .map(|left| now_unix() + left.as_secs() as i64 + 1)
+            .unwrap_or(0),
+        None => 0,
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(text) = serde_json::to_string(&AuthThrottle {
+        failed_attempts,
+        cooldown_until_unix,
+    }) {
+        let _ = std::fs::write(path, text);
     }
 }
 
@@ -79,11 +127,14 @@ impl AppState {
         let fails = self.failed_unlocks.fetch_add(1, Ordering::Relaxed) + 1;
         if fails >= AUTH_MAX_FAILS {
             self.failed_unlocks.store(0, Ordering::Relaxed);
-            if let Ok(mut until) = self.cooldown_until.lock() {
-                *until = Some(Instant::now() + Duration::from_secs(AUTH_COOLDOWN_SECS));
+            let until = Instant::now() + Duration::from_secs(AUTH_COOLDOWN_SECS);
+            if let Ok(mut slot) = self.cooldown_until.lock() {
+                *slot = Some(until);
             }
+            write_auth_throttle(&self.auth_throttle_path, 0, Some(until));
             return "认证连续失败 5 次，请 60 秒后再试".to_string();
         }
+        write_auth_throttle(&self.auth_throttle_path, fails, None);
         format!("{label}，还可尝试 {} 次", AUTH_MAX_FAILS - fails)
     }
 
@@ -92,6 +143,7 @@ impl AppState {
         if let Ok(mut until) = self.cooldown_until.lock() {
             *until = None;
         }
+        write_auth_throttle(&self.auth_throttle_path, 0, None);
     }
 }
 
@@ -729,12 +781,20 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                 if has_password(&state) {
                     state.unlocked.store(false, Ordering::Relaxed);
                     let _ = app.emit("locked", ());
+                    // 托盘在锁屏之外，锁定后不能继续暴露今日活跃数据
+                    if let Some(tray) = app.tray_by_id("main") {
+                        let _ = tray.set_tooltip(Some("Activity Worklog · 已锁定"));
+                    }
                 }
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.hide();
                 }
             }
-            "quit" => app.exit(0),
+            "quit" => {
+                // 双保险：部分平台 app.exit 不一定派发 ExitRequested，这里先收口再退出
+                flush_before_exit(app);
+                app.exit(0);
+            }
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -897,8 +957,14 @@ fn spawn_activity_loop(app: AppHandle) {
             } else {
                 0
             };
+            // 锁定态下托盘只显示中性文案，不泄露统计信息
+            let tooltip = if state.unlocked.load(Ordering::Relaxed) {
+                format!("Activity Worklog · 今日活跃 {pct}%")
+            } else {
+                "Activity Worklog · 已锁定".to_string()
+            };
             if let Some(tray) = app.tray_by_id("main") {
-                let _ = tray.set_tooltip(Some(format!("Activity Worklog · 今日活跃 {pct}%")));
+                let _ = tray.set_tooltip(Some(tooltip));
             }
         }
     });
@@ -973,6 +1039,17 @@ fn spawn_sync_loop(app: AppHandle) {
     });
 }
 
+/// 退出前把当天还在进行中的段落收口落库，
+/// 避免「最后一次采样 → 退出」之间的时长凭空丢失。
+fn flush_before_exit(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    if let Ok(mut store) = state.store.lock() {
+        if let Ok(mut segments) = store.load_segments_for_today() {
+            let _ = store.close_open_segments(&mut segments, Local::now());
+        }
+    }
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
@@ -1007,13 +1084,26 @@ fn main() {
                     let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
                 }
             }
+            // 恢复上次进程遗留的认证节流状态：重启不能当成「失败次数清零」
+            let auth_throttle_path = dirs::data_local_dir()
+                .unwrap_or_else(std::env::temp_dir)
+                .join("activity-worklog")
+                .join("auth-throttle.json");
+            let throttled = read_auth_throttle(&auth_throttle_path);
+            let remaining = throttled.cooldown_until_unix.saturating_sub(now_unix());
+            let cooldown = if remaining > 0 {
+                Some(Instant::now() + Duration::from_secs(remaining as u64))
+            } else {
+                None
+            };
             app.manage(AppState {
                 store: Mutex::new(store),
                 paused: AtomicBool::new(false),
                 resetting: AtomicU8::new(0),
                 unlocked: AtomicBool::new(!locked),
-                failed_unlocks: AtomicU32::new(0),
-                cooldown_until: Mutex::new(None),
+                failed_unlocks: AtomicU32::new(throttled.failed_attempts),
+                cooldown_until: Mutex::new(cooldown),
+                auth_throttle_path,
             });
             spawn_activity_loop(app.handle().clone());
             spawn_sync_loop(app.handle().clone());
@@ -1031,6 +1121,9 @@ fn main() {
                     if has_password(&state) {
                         state.unlocked.store(false, Ordering::Relaxed);
                         let _ = app.emit("locked", ());
+                        if let Some(tray) = app.tray_by_id("main") {
+                            let _ = tray.set_tooltip(Some("Activity Worklog · 已锁定"));
+                        }
                     }
                 }
             }
@@ -1061,6 +1154,12 @@ fn main() {
             restore_db,
             check_update
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run app");
+        .build(tauri::generate_context!())
+        .expect("failed to build app")
+        .run(|app, event| {
+            // 托盘「退出」、⌘Q、系统关机都会经过这里；先收口当天段落再让进程退出
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                flush_before_exit(app);
+            }
+        });
 }
