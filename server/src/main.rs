@@ -10,7 +10,7 @@ use axum::{Json, Router};
 use chrono::{Datelike, Local, NaiveDate};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{Any, AllowOrigin, CorsLayer};
 
 struct AppState {
     conn: Mutex<Connection>,
@@ -383,6 +383,16 @@ async fn main() {
     println!("访问 Token：{token}");
     println!("（Token 保存在 {}，客户端“数据同步”页需填入同一 Token）", data_dir().join("server-token.txt").display());
 
+    // 服务只监听 127.0.0.1，本就不可被外部网络访问；CORS 进一步收紧到本机来源，
+    // 避免同机其他来源的前端跨域调用同步/报表接口（不再 permissive）。
+    let cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(|origin, _| {
+            let bytes = origin.as_bytes();
+            bytes.starts_with(b"http://127.0.0.1") || bytes.starts_with(b"http://localhost")
+        }))
+        .allow_methods(Any)
+        .allow_headers(Any);
+
     let app = Router::new()
         .route("/", get(dashboard))
         .route("/api/health", get(health))
@@ -390,7 +400,7 @@ async fn main() {
         .route("/api/reports/daily", get(daily_report))
         .route("/api/reports/weekly", get(weekly_report))
         .route("/api/reports/monthly", get(monthly_report))
-        .layer(CorsLayer::permissive())
+        .layer(cors)
         .with_state(std::sync::Arc::new(AppState {
             conn: Mutex::new(conn),
             token,

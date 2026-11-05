@@ -55,7 +55,8 @@ jobs:
           tagName: v__VERSION__
           releaseName: "Activity Worklog v__VERSION__"
           releaseBody: "自动构建的 macOS 安装包与更新资源。"
-          # 先作为草稿发布，确认无误后在 GitHub 页面手动 Publish（草稿状态下 /latest/download 不生效）
-          releaseDraft: true
+          # 必须发布态（非草稿）：updater 端点 /releases/latest/download 只解析已发布的 Release，
+          # 草稿态会 404 导致更新检测失败。签名需先配置 TAURI_SIGNING_PRIVATE_KEY。
+          releaseDraft: false
           prerelease: false
           args: ""

@@ -248,6 +248,8 @@ fn save_segments(
 
 #[tauri::command]
 fn get_settings(state: State<AppState>) -> Result<AppSettings, String> {
+    // 锁屏态禁止读取设置：否则可通过 IPC 绕过应用锁拿到 sync_url / sync_token 等凭据
+    ensure_unlocked(&state)?;
     let mut settings = state
         .store
         .lock()

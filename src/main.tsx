@@ -2282,15 +2282,38 @@ function TrendChart({ bars, target }: { bars: TrendBar[]; target?: number }) {
 }
 
 /** 将按日期降序的明细按 7 天一组聚合为周趋势 */
+/** ISO 周键（与同步服务端 iso_week_key 口径一致）：年份-Www，周一为一周起点 */
+function isoWeekKey(dateStr: string): string {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const date = new Date(Date.UTC(y, m - 1, d));
+  const dayNum = (date.getUTCDay() + 6) % 7; // 周一=0 … 周日=6
+  date.setUTCDate(date.getUTCDate() - dayNum + 3); // 移到本周四
+  const thursdayYear = date.getUTCFullYear();
+  const firstThursday = new Date(Date.UTC(thursdayYear, 0, 4));
+  const week =
+    1 +
+    Math.round(
+      ((date.getTime() - firstThursday.getTime()) / 86400000 -
+        3 +
+        ((firstThursday.getUTCDay() + 6) % 7)) /
+        7
+    );
+  return `${thursdayYear}-W${String(week).padStart(2, "0")}`;
+}
+
 function aggregateByWeek(records: DailyRecord[]): TrendBar[] {
   const sorted = [...records].sort((a, b) => a.date.localeCompare(b.date));
-  const weeks: TrendBar[] = [];
-  for (let i = 0; i < sorted.length; i += 7) {
-    const group = sorted.slice(i, i + 7);
-    const minutes = group.reduce((s, d) => s + d.active_minutes, 0);
-    weeks.push({ label: group[0].date.slice(5), minutes, date: group[0].date });
+  const groups = new Map<string, { minutes: number; lastDate: string }>();
+  for (const r of sorted) {
+    const key = isoWeekKey(r.date);
+    const g = groups.get(key) ?? { minutes: 0, lastDate: r.date };
+    g.minutes += r.active_minutes;
+    if (r.date > g.lastDate) g.lastDate = r.date;
+    groups.set(key, g);
   }
-  return weeks;
+  return [...groups.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([key, g]) => ({ label: key, minutes: g.minutes, date: g.lastDate }));
 }
 
 /** 作息对比：每天的实际活跃区间 vs 计划工作时段 */
