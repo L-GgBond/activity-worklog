@@ -248,6 +248,55 @@ fn notify_macos(app: &AppHandle, message: &str) {
     let _ = app.shell().command("osascript").args(["-e", &script]).spawn();
 }
 
+/// 立即把待同步记录推一次，不等定时器。
+#[tauri::command]
+async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
+    let settings = {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| "store lock failed".to_string())?;
+        store.get_settings().map_err(|err| err.to_string())?
+    };
+    if !settings.sync_enabled {
+        return Err("请先启用同步".into());
+    }
+    if settings.sync_url.trim().is_empty() {
+        return Err("请先填写服务器地址".into());
+    }
+
+    let pending = {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| "store lock failed".to_string())?;
+        store.pending_records().map_err(|err| err.to_string())?
+    };
+    if pending.is_empty() {
+        return Ok("没有待同步的记录".into());
+    }
+
+    let dates: Vec<String> = pending.iter().map(|record| record.date.clone()).collect();
+    let client = HttpSyncClient::new();
+    let accepted = client
+        .push_records(&settings, pending)
+        .await
+        .map_err(|err| err.to_string())?;
+    let synced = if accepted.is_empty() { dates } else { accepted };
+
+    {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| "store lock failed".to_string())?;
+        store
+            .mark_synced(&synced)
+            .map_err(|err| err.to_string())?;
+    }
+    let _ = app.emit("records-updated", ());
+    Ok(format!("已同步 {} 天记录", synced.len()))
+}
+
 #[tauri::command]
 async fn test_sync_connection(settings: AppSettings) -> Result<String, String> {
     let client = HttpSyncClient::new();
@@ -556,6 +605,13 @@ fn main() {
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
+            // macOS 上没有应用菜单栏时，WKWebView 拿不到标准的 ⌘C/⌘V/⌘Q，
+            // 这里挂上系统默认菜单（仅 macOS，Windows 不需要窗口菜单）。
+            #[cfg(target_os = "macos")]
+            {
+                let menu = Menu::default(app.handle())?;
+                menu.set_as_app_menu()?;
+            }
             setup_tray(app.handle())?;
             let store = Store::open()?;
             // 菜单栏驻留模式：隐藏 Dock 图标，仅菜单栏常驻（需重启生效）
@@ -590,6 +646,7 @@ fn main() {
             save_settings,
             export_records_csv,
             test_sync_connection,
+            sync_now,
             is_paused,
             toggle_pause,
             export_report,

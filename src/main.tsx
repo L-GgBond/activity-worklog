@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -7,6 +7,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import {
   Activity,
   BarChart3,
+  ChevronRight,
   Clock3,
   Database,
   Download,
@@ -17,7 +18,7 @@ import {
   Trash2,
   RefreshCcw,
   SlidersHorizontal,
-  TrendingUp
+  Target
 } from "lucide-react";
 import { toBlob } from "html-to-image";
 import { jsPDF } from "jspdf";
@@ -202,6 +203,15 @@ function formatMinutes(minutes: number) {
   return `${h}小时${m.toString().padStart(2, "0")}分`;
 }
 
+/** 简短时长：不足 1 小时只显示分钟，避免「0小时24分」这种读法 */
+function formatSpan(minutes: number) {
+  const total = Math.max(Math.round(minutes), 0);
+  const h = Math.floor(total / 60);
+  const m = total % 60;
+  if (h === 0) return `${m}分钟`;
+  return m === 0 ? `${h}小时` : `${h}小时${m}分`;
+}
+
 function timeToSeconds(time: string) {
   const [h, m, s] = time.split(":").map(Number);
   return (h || 0) * 3600 + (m || 0) * 60 + (s || 0);
@@ -235,7 +245,12 @@ function App() {
   const [checking, setChecking] = useState(false);
   const [paused, setPaused] = useState(false);
   const [syncInfo, setSyncInfo] = useState<SyncSummary | null>(null);
+  const [manualSyncing, setManualSyncing] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
+  const [monthFilter, setMonthFilter] = useState("");
+  const [expandedDate, setExpandedDate] = useState<string | null>(null);
+  const [expandedSegments, setExpandedSegments] = useState<Segment[]>([]);
+  const [expandedLoading, setExpandedLoading] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
 
   const settingsRef = useRef(settings);
@@ -261,11 +276,19 @@ function App() {
 
 
   const displayRecords = records.length ? records : isPreview ? fallbackRecords : [];
+  const months = useMemo(() => {
+    const set = new Set<string>();
+    for (const record of displayRecords) set.add(record.date.slice(0, 7));
+    return Array.from(set);
+  }, [displayRecords]);
+  const visibleRecords = monthFilter
+    ? displayRecords.filter((record) => record.date.startsWith(monthFilter))
+    : displayRecords;
   const today = displayRecords[0] ?? null;
   const todayStr = today?.date ?? "";
 
   const syncState = syncTestResult
-    ? syncTestResult.startsWith("连接成功")
+    ? /^(连接成功|已同步|没有待同步)/.test(syncTestResult)
       ? "ok"
       : "err"
     : "";
@@ -360,6 +383,29 @@ function App() {
       .then(setSegments)
       .catch(() => setSegments(fallbackSegments));
   }, [todayStr, records]);
+
+  // 键盘快捷键：⌘/Ctrl+R 刷新、⌘/Ctrl+, 打开设置、⌘/Ctrl+1..4 切换页面
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!(event.metaKey || event.ctrlKey) || event.altKey) return;
+      const key = event.key.toLowerCase();
+      if (key === "r") {
+        event.preventDefault();
+        refresh();
+      } else if (key === ",") {
+        event.preventDefault();
+        setPage("settings");
+      } else if (key >= "1" && key <= "4") {
+        event.preventDefault();
+        const target = (["records", "analytics", "sync", "settings"] as Page[])[
+          Number(key) - 1
+        ];
+        if (target) setPage(target);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [refresh]);
 
   // 窗口尺寸记忆：启动恢复上次尺寸，拖动停止后保存
   useEffect(() => {
@@ -456,6 +502,27 @@ function App() {
     return () => unlisten?.();
   }, []);
 
+  async function toggleDay(date: string) {
+    if (expandedDate === date) {
+      setExpandedDate(null);
+      return;
+    }
+    setExpandedDate(date);
+    setExpandedLoading(true);
+    setExpandedSegments([]);
+    try {
+      const list = await invoke<Segment[]>("list_segments", { date });
+      setExpandedSegments(list);
+    } catch {
+      // 浏览器预览没有本地库，用该天的演示时段填充
+      setExpandedSegments(
+        inTauri ? [] : buildDemoSegments(displayRecords.find((item) => item.date === date))
+      );
+    } finally {
+      setExpandedLoading(false);
+    }
+  }
+
   async function deleteDay(date: string) {
     if (pendingDelete !== date) {
       setPendingDelete(date);
@@ -497,6 +564,21 @@ function App() {
       pushLog(nowPaused ? "已暂停记录" : "已恢复记录");
     } catch {
       setStatus("操作失败，请重试");
+    }
+  }
+
+  async function syncNow() {
+    setManualSyncing(true);
+    try {
+      const msg = await invoke<string>("sync_now");
+      setSyncTestResult(msg);
+      pushLog(msg);
+      await refresh();
+    } catch (err) {
+      setSyncTestResult(String(err));
+      pushLog(`立即同步失败：${err}`);
+    } finally {
+      setManualSyncing(false);
     }
   }
 
@@ -788,11 +870,21 @@ function App() {
                 <span className="statusDot" />
                 <strong>今日记录正常</strong>
               </div>
-              <span>{isPreview ? "演示数据" : `最近活动 ${today.last_activity_at ?? "等待中"}`}</span>
+              <span>
+                {`${isPreview ? "演示数据 · " : ""}${new Date(
+                  `${today.date}T00:00:00`
+                ).toLocaleDateString("zh-CN", { weekday: "long" })} · 共 ${
+                  segments.length
+                } 段记录`}
+              </span>
             </div>
             <section className="hero">
               <div className="heroRing">
-                <TodayRing active={today.active_minutes} idle={today.idle_minutes} />
+                <TodayRing
+                  active={today.active_minutes}
+                  idle={today.idle_minutes}
+                  target={settings.daily_target_minutes}
+                />
               </div>
               <div className="heroStats">
                 <div className="heroStat">
@@ -808,17 +900,35 @@ function App() {
                   <strong>{formatMinutes(today.active_minutes)}</strong>
                 </div>
                 <div className="heroStat">
-                  <span><TrendingUp size={16} />活跃占比</span>
-                  <strong>
-                    {today.active_minutes + today.idle_minutes > 0
-                      ? Math.round(
-                          (today.active_minutes /
-                            (today.active_minutes + today.idle_minutes)) *
-                            100
-                        )
-                      : 0}
-                    %
-                  </strong>
+                  {settings.daily_target_minutes > 0 ? (
+                    <>
+                      <span>
+                        <Target size={16} />
+                        {today.active_minutes >= settings.daily_target_minutes
+                          ? "超出目标"
+                          : "距目标"}
+                      </span>
+                      <strong>
+                        {today.active_minutes >= settings.daily_target_minutes
+                          ? `+${formatSpan(today.active_minutes - settings.daily_target_minutes)}`
+                          : formatSpan(settings.daily_target_minutes - today.active_minutes)}
+                      </strong>
+                    </>
+                  ) : (
+                    <>
+                      <span><Target size={16} />活跃占比</span>
+                      <strong>
+                        {today.active_minutes + today.idle_minutes > 0
+                          ? Math.round(
+                              (today.active_minutes /
+                                (today.active_minutes + today.idle_minutes)) *
+                                100
+                            )
+                          : 0}
+                        %
+                      </strong>
+                    </>
+                  )}
                 </div>
               </div>
             </section>
@@ -893,6 +1003,21 @@ function App() {
                   <h2>历史记录</h2>
                   <p>共 {displayRecords.length} 天，本地保存，可按需同步数据库</p>
                 </div>
+                {months.length > 1 && (
+                  <select
+                    className="monthFilter"
+                    value={monthFilter}
+                    onChange={(event) => setMonthFilter(event.target.value)}
+                    aria-label="按月份筛选"
+                  >
+                    <option value="">全部月份</option>
+                    {months.map((month) => (
+                      <option key={month} value={month}>
+                        {month.replace("-", " 年 ")} 月
+                      </option>
+                    ))}
+                  </select>
+                )}
               </div>
               <div className="table">
                 <div className="row head">
@@ -903,7 +1028,7 @@ function App() {
                   <span>空闲</span>
                   <span>同步</span>
                 </div>
-                {displayRecords.map((record) => {
+                {visibleRecords.map((record) => {
                   const empty = record.active_minutes + record.idle_minutes === 0;
                   const status =
                     record.sync_status === "synced"
@@ -913,27 +1038,85 @@ function App() {
                       : record.sync_status === "error"
                       ? "同步失败"
                       : record.sync_status;
+                  const open = expandedDate === record.date;
                   return (
-                    <div className={`row${empty ? " rowEmpty" : ""}`} key={record.date}>
-                      <span>{record.date}</span>
-                      <span>{record.first_activity_at ?? "—"}</span>
-                      <span>{record.last_activity_at ?? "—"}</span>
-                      <span>{empty ? "—" : formatMinutes(record.active_minutes)}</span>
-                      <span>{empty ? "—" : formatMinutes(record.idle_minutes)}</span>
-                      <span className={`sync ${record.sync_status}`}>{status}</span>
-                      <button
-                        type="button"
-                        className={`rowDelete${pendingDelete === record.date ? " confirming" : ""}`}
-                        title={
-                          pendingDelete === record.date
-                            ? "再次点击确认删除"
-                            : "删除这一天的记录"
-                        }
-                        onClick={() => deleteDay(record.date)}
+                    <Fragment key={record.date}>
+                      <div
+                        className={`row rowClickable${empty ? " rowEmpty" : ""}${open ? " rowOpen" : ""}`}
+                        role="button"
+                        tabIndex={0}
+                        aria-expanded={open}
+                        onClick={() => toggleDay(record.date)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter" || event.key === " ") {
+                            event.preventDefault();
+                            toggleDay(record.date);
+                          }
+                        }}
                       >
-                        {pendingDelete === record.date ? "确认删除" : <Trash2 size={13} />}
-                      </button>
-                    </div>
+                        <span className="cellDate">
+                          <ChevronRight
+                            size={12}
+                            className={open ? "rowCaret open" : "rowCaret"}
+                          />
+                          {record.date}
+                        </span>
+                        <span>{record.first_activity_at ?? "—"}</span>
+                        <span>{record.last_activity_at ?? "—"}</span>
+                        <span>{empty ? "—" : formatMinutes(record.active_minutes)}</span>
+                        <span>{empty ? "—" : formatMinutes(record.idle_minutes)}</span>
+                        <span className={`sync ${record.sync_status}`}>{status}</span>
+                        <button
+                          type="button"
+                          className={`rowDelete${pendingDelete === record.date ? " confirming" : ""}`}
+                          title={
+                            pendingDelete === record.date
+                              ? "再次点击确认删除"
+                              : "删除这一天的记录"
+                          }
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            deleteDay(record.date);
+                          }}
+                        >
+                          {pendingDelete === record.date ? "确认删除" : <Trash2 size={13} />}
+                        </button>
+                      </div>
+                      {open && (
+                        <div className="rowDetail">
+                          {expandedLoading && <span className="rowDetailEmpty">读取时段…</span>}
+                          {!expandedLoading && expandedSegments.length === 0 && (
+                            <span className="rowDetailEmpty">这一天没有时段记录</span>
+                          )}
+                          {!expandedLoading &&
+                            expandedSegments.map((segment, index) => {
+                              const minutes = Math.max(
+                                Math.round(
+                                  (timeToSeconds(segment.ended_at) -
+                                    timeToSeconds(segment.started_at)) /
+                                    60
+                                ),
+                                0
+                              );
+                              return (
+                                <div
+                                  className={`segmentRow ${segment.segment_type}`}
+                                  key={`${segment.started_at}-${index}`}
+                                >
+                                  <i className="segmentDot" />
+                                  <span className="segmentType">
+                                    {segment.segment_type === "work" ? "工作" : "离开"}
+                                  </span>
+                                  <span className="segmentTime">
+                                    {shortTime(segment.started_at)} – {shortTime(segment.ended_at)}
+                                  </span>
+                                  <span className="segmentDur">{formatSpan(minutes)}</span>
+                                </div>
+                              );
+                            })}
+                        </div>
+                      )}
+                    </Fragment>
                   );
                 })}
               </div>
@@ -1004,6 +1187,14 @@ function App() {
               </label>
               <div className="formActions">
                 <button className="primary" onClick={testSync}>测试连接</button>
+                <button
+                  onClick={syncNow}
+                  disabled={manualSyncing || !settings.sync_enabled}
+                  title={settings.sync_enabled ? "立刻推送待同步记录" : "请先启用同步"}
+                >
+                  <RefreshCcw size={15} />
+                  {manualSyncing ? "同步中…" : "立即同步"}
+                </button>
                 {syncTestResult && (
                   <span className={`syncResult ${syncState}`}>{syncTestResult}</span>
                 )}
@@ -1189,7 +1380,7 @@ function App() {
                 </div>
                 <div className="aboutRow">
                   <span>快捷键</span>
-                  <strong>⌘R 刷新 · ⌘Q 退出 · ⌘W 关闭窗口</strong>
+                  <strong>⌘R 刷新 · ⌘, 打开设置 · ⌘1–4 切换页面</strong>
                 </div>
                 {updateInfo && updateInfo.status === "available" && (
                   <div className="updateBox">
@@ -1640,14 +1831,32 @@ function DonutChart({ records }: { records: DailyRecord[] }) {
 }
 
 /* ---------------- 今日概览环形 ---------------- */
-function TodayRing({ active, idle }: { active: number; idle: number }) {
-  const total = active + idle || 1;
-  const pct = Math.round((active / total) * 100);
+function TodayRing({
+  active,
+  idle,
+  target
+}: {
+  active: number;
+  idle: number;
+  target: number;
+}) {
+  const total = active + idle;
+  const useTarget = target > 0;
+  // 有目标时画「目标达成度」，没有目标才退回「活跃占比」
+  const ratio = useTarget ? active / target : total > 0 ? active / total : 0;
+  const rawPct = Math.round(ratio * 100);
+  const arcPct = Math.min(Math.max(ratio, 0), 1);
   const R = 58;
   const C = 2 * Math.PI * R;
-  const dash = (pct / 100) * C;
+  const dash = arcPct * C;
+  const targetHours = (target / 60).toFixed(target % 60 === 0 ? 0 : 1);
   return (
-    <svg viewBox="0 0 160 160" className="ring" role="img" aria-label="今日活跃占比">
+    <svg
+      viewBox="0 0 160 160"
+      className="ring"
+      role="img"
+      aria-label={useTarget ? "今日目标达成度" : "今日活跃占比"}
+    >
       <defs>
         <linearGradient id="grad-ring" x1="0" y1="0" x2="1" y2="1">
           <stop offset="0%" stopColor="#4aa887" />
@@ -1665,8 +1874,10 @@ function TodayRing({ active, idle }: { active: number; idle: number }) {
           strokeDasharray={`${dash} ${C - dash}`}
           transform="rotate(-90 80 80)"
         />
-        <text x={80} y={76} textAnchor="middle" className="ringPct">{pct}%</text>
-        <text x={80} y={100} textAnchor="middle" className="ringLabel">今日活跃</text>
+        <text x={80} y={76} textAnchor="middle" className="ringPct">{rawPct}%</text>
+        <text x={80} y={100} textAnchor="middle" className="ringLabel">
+          {useTarget ? `目标 ${targetHours}h` : "今日活跃"}
+        </text>
       </g>
     </svg>
   );
@@ -1722,6 +1933,29 @@ function AnalyticsPage({
   const avgActive = days ? Math.round(totalActive / days) : 0;
   const avgIdle = days ? Math.round(totalIdle / days) : 0;
   const eff = avgActive + avgIdle > 0 ? Math.round((avgActive / (avgActive + avgIdle)) * 100) : 0;
+
+  // 本期小结：把「最早/最晚/达标/早退」这些要自己从图里读的结论直接写出来
+  const activeDays = slice.filter((d) => d.active_minutes + d.idle_minutes > 0);
+  const earliestStart = activeDays.reduce<string | null>(
+    (best, d) =>
+      d.first_activity_at && (!best || d.first_activity_at < best) ? d.first_activity_at : best,
+    null
+  );
+  const latestEnd = activeDays.reduce<string | null>(
+    (best, d) =>
+      d.last_activity_at && (!best || d.last_activity_at > best) ? d.last_activity_at : best,
+    null
+  );
+  // 达标 / 早退只按工作日算，周末加班或早收工不该进这两项
+  const activeWorkdays = activeDays.filter((d) => {
+    const weekday = new Date(`${d.date}T00:00:00`).getDay();
+    return weekday !== 0 && weekday !== 6;
+  });
+  const overTarget =
+    target > 0 ? activeWorkdays.filter((d) => d.active_minutes >= target).length : 0;
+  const earlyOff = activeWorkdays.filter(
+    (d) => d.last_activity_at && parseHM(d.last_activity_at) < parseHM(settings.work_end)
+  ).length;
 
   const isWeekend = (date: string) => {
     const g = new Date(`${date}T00:00:00`).getDay();
@@ -1835,6 +2069,33 @@ function AnalyticsPage({
           </div>
           <div className="reportBrand">Activity Worklog</div>
         </div>
+
+        {activeDays.length === 0 ? (
+          <p className="insight empty">这段时间还没有活动记录，保持应用在后台运行即可自动统计。</p>
+        ) : (
+          <div className="insight">
+            <p>
+              本期 <strong>{activeDays.length}</strong> 天有记录，共活跃{" "}
+              <strong>{formatMinutes(totalActive)}</strong>，日均{" "}
+              <strong>{formatMinutes(avgActive)}</strong>，平均效率 <strong>{eff}%</strong>。
+            </p>
+            <p>
+              最早 <strong>{earliestStart ?? "—"}</strong> 开始、最晚{" "}
+              <strong>{latestEnd ?? "—"}</strong> 结束
+              {target > 0 && (
+                <>
+                  ；<strong>{overTarget}</strong> 个工作日达到 {Math.round(target / 60)} 小时目标
+                </>
+              )}
+              {earlyOff > 0 && (
+                <>
+                  ，另有 <strong>{earlyOff}</strong> 个工作日 {settings.work_end} 前下班
+                </>
+              )}
+              。
+            </p>
+          </div>
+        )}
 
       <section className="kpiGrid">
         <div className="kpi">
@@ -2102,4 +2363,35 @@ function HourHeatmap({ hours }: { hours: HourBucket[] }) {
   );
 }
 
-createRoot(document.getElementById("root")!).render(<App />);
+/** 渲染异常兜底：避免白屏，给出最小可恢复路径 */
+class ErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  { error: Error | null }
+> {
+  state: { error: Error | null } = { error: null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+
+  render() {
+    const { error } = this.state;
+    if (!error) return this.props.children;
+    return (
+      <div className="crash">
+        <h2>界面渲染出错了</h2>
+        <p>本地数据未受影响，重新加载即可恢复。</p>
+        <code>{error.message}</code>
+        <button className="primary" onClick={() => window.location.reload()}>
+          重新加载
+        </button>
+      </div>
+    );
+  }
+}
+
+createRoot(document.getElementById("root")!).render(
+  <ErrorBoundary>
+    <App />
+  </ErrorBoundary>
+);

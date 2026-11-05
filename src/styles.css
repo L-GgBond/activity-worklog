@@ -581,6 +581,19 @@ button.primary:disabled {
   background: var(--accent-soft);
 }
 
+/* .formActions button 与 button.primary 同权重且位置更靠后，主按钮需要显式覆盖 */
+.formActions button.primary {
+  color: var(--on-accent);
+  border-color: transparent;
+  background: var(--accent);
+}
+
+.formActions button.primary:hover {
+  color: var(--on-accent);
+  border-color: transparent;
+  background: var(--accent-strong);
+}
+
 .formActions button.dangerBtn {
   color: var(--danger);
   border-color: rgba(184, 70, 47, 0.24);
@@ -598,9 +611,16 @@ button.primary:disabled {
   background: var(--danger);
 }
 
-.exportBtn:disabled {
+.exportBtn:disabled,
+.formActions button:disabled {
   opacity: 0.55;
   cursor: default;
+}
+
+.formActions button:disabled:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+  background: var(--surface);
 }
 
 .exportBtn svg,
@@ -968,6 +988,112 @@ button.primary:disabled {
 .row span:first-child {
   color: var(--text);
   font-weight: 550;
+}
+
+/* 可展开行 */
+.rowClickable {
+  cursor: pointer;
+}
+
+.rowOpen {
+  background: var(--surface-2);
+}
+
+.cellDate {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.rowCaret {
+  flex: 0 0 auto;
+  color: var(--text-faint);
+  transition: transform 0.15s ease;
+}
+
+.rowCaret.open {
+  transform: rotate(90deg);
+}
+
+/* 展开后的当天时段 */
+.rowDetail {
+  display: grid;
+  gap: 5px;
+  padding: 10px 20px 12px 40px;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--surface-3);
+  box-shadow: inset 2px 0 0 var(--accent-line);
+}
+
+.rowDetailEmpty {
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
+.segmentRow {
+  display: grid;
+  grid-template-columns: 8px 30px 118px auto;
+  justify-content: start;
+  align-items: center;
+  column-gap: 10px;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.segmentDot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+
+.segmentRow.work .segmentDot {
+  background: var(--work);
+}
+
+.segmentRow.away .segmentDot {
+  background: var(--away);
+}
+
+.segmentType {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.segmentTime {
+  font-variant-numeric: tabular-nums;
+}
+
+.segmentDur {
+  color: var(--text-dim);
+}
+
+/* 月份筛选 */
+.monthFilter {
+  flex: 0 0 auto;
+  height: 30px;
+  padding: 0 28px 0 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+  background-color: var(--surface);
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='none' stroke='%238a939c' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+}
+
+.monthFilter:hover {
+  border-color: var(--accent-line);
+}
+
+.monthFilter:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: var(--ring);
 }
 
 .rowEmpty span:not(.sync) {
@@ -1575,6 +1701,29 @@ input[type="range"]::-moz-range-thumb {
   white-space: nowrap;
 }
 
+/* 报表顶部小结 */
+.insight {
+  display: grid;
+  gap: 3px;
+  padding: 11px 14px;
+  border: 1px solid var(--accent-line);
+  border-radius: var(--r-md);
+  background: var(--accent-soft);
+  color: var(--text-dim);
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+
+.insight strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.insight.empty {
+  border-color: var(--border);
+  background: var(--surface-2);
+}
+
 .kpiGrid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -2170,6 +2319,46 @@ input[type="range"]::-moz-range-thumb {
 
 .saveToast.preview .toastDot {
   background: var(--away);
+}
+
+/* ============================ 崩溃兜底 ============================ */
+
+.crash {
+  display: grid;
+  justify-items: start;
+  gap: 10px;
+  max-width: 520px;
+  margin: 12vh auto;
+  padding: 24px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+}
+
+.crash h2 {
+  font-size: 15px;
+}
+
+.crash p {
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+.crash code {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  color: var(--danger);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  overflow-x: auto;
+}
+
+.crash button.primary {
+  margin-top: 4px;
 }
 
 /* ============================ 动效 ============================ */
