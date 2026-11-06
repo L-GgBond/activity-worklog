@@ -2,27 +2,37 @@ import React, { Fragment, useCallback, useEffect, useMemo, useRef, useState } fr
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
+import { getCurrentWindow, LogicalSize, LogicalPosition } from "@tauri-apps/api/window";
 import { getVersion } from "@tauri-apps/api/app";
 import {
   Activity,
+  AlertTriangle,
   BarChart3,
+  Bell,
   CalendarPlus,
+  ChevronDown,
   ChevronRight,
   Clock3,
   Database,
   Download,
+  Eye,
+  EyeOff,
   FileJson,
   FolderOpen,
+  Inbox,
   Moon,
   Pause,
   Play,
   Power,
+  RotateCcw,
+  Search,
+  Send,
   Trash2,
   RefreshCcw,
   SlidersHorizontal,
   Target,
-  Timer
+  Timer,
+  X
 } from "lucide-react";
 import "./styles.css";
 
@@ -61,6 +71,9 @@ type Settings = {
   lunch_end: string;
   window_width: number;
   window_height: number;
+  window_x: number;
+  window_y: number;
+  window_pos_set: boolean;
   theme: "system" | "light" | "dark";
   daily_target_minutes: number;
   retention_days: number;
@@ -113,6 +126,9 @@ const defaultSettings: Settings = {
   lunch_end: "13:30",
   window_width: 0,
   window_height: 0,
+  window_x: 0,
+  window_y: 0,
+  window_pos_set: false,
   theme: "system",
   daily_target_minutes: 480,
   retention_days: 0,
@@ -457,6 +473,134 @@ function DateListEditor({
   );
 }
 
+/* ---------------------------- 统一基础组件 ---------------------------- */
+
+function Modal({
+  open,
+  title,
+  children,
+  onClose,
+  footer,
+  danger
+}: {
+  open: boolean;
+  title: string;
+  children: React.ReactNode;
+  onClose: () => void;
+  footer?: React.ReactNode;
+  danger?: boolean;
+}) {
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
+  if (!open) return null;
+  return (
+    <div className="modalOverlay" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className={`modalCard${danger ? " danger" : ""}`} role="dialog" aria-modal="true" aria-label={title}>
+        <div className="modalHead">
+          <h2>{title}</h2>
+          <button type="button" className="modalClose" onClick={onClose} aria-label="关闭">
+            <X size={16} />
+          </button>
+        </div>
+        <div className="modalBody">{children}</div>
+        {footer && <div className="modalFoot">{footer}</div>}
+      </div>
+    </div>
+  );
+}
+
+function Tooltip({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <span className="tipWrap">
+      {children}
+      <span className="tip" role="tooltip">{label}</span>
+    </span>
+  );
+}
+
+function Empty({
+  icon,
+  title,
+  description,
+  action
+}: {
+  icon?: React.ReactNode;
+  title: string;
+  description?: string;
+  action?: React.ReactNode;
+}) {
+  return (
+    <div className="emptyState">
+      <div className="emptyIcon">{icon ?? <Inbox size={26} />}</div>
+      <h3>{title}</h3>
+      {description && <p>{description}</p>}
+      {action && <div className="emptyActions">{action}</div>}
+    </div>
+  );
+}
+
+function Skeleton({ lines = 3, className = "" }: { lines?: number; className?: string }) {
+  return (
+    <div className={`skeleton ${className}`} aria-hidden="true">
+      {Array.from({ length: lines }).map((_, i) => (
+        <span key={i} className="skeletonBar" style={{ width: `${88 - i * 14}%` }} />
+      ))}
+    </div>
+  );
+}
+
+function Spinner({ size = 16 }: { size?: number }) {
+  return <span className="spinner" style={{ width: size, height: size }} aria-label="加载中" />;
+}
+
+/** 带显示/隐藏切换的密码输入框，锁屏、引导、安全面板共用 */
+function PasswordInput({
+  value,
+  onChange,
+  placeholder,
+  autoComplete,
+  autoFocus,
+  invalid
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  placeholder?: string;
+  autoComplete?: string;
+  autoFocus?: boolean;
+  invalid?: boolean;
+}) {
+  const [visible, setVisible] = useState(false);
+  return (
+    <div className="passwordWrap">
+      <input
+        className={invalid ? "fieldInvalid" : ""}
+        type={visible ? "text" : "password"}
+        value={value}
+        spellCheck={false}
+        autoFocus={autoFocus}
+        autoComplete={autoComplete}
+        placeholder={placeholder}
+        onChange={(event) => onChange(event.target.value)}
+      />
+      <button
+        type="button"
+        className="passwordToggle"
+        aria-label={visible ? "隐藏密码" : "显示密码"}
+        onClick={() => setVisible((v) => !v)}
+      >
+        {visible ? <EyeOff size={16} /> : <Eye size={16} />}
+      </button>
+    </div>
+  );
+}
+
 function App() {
   const [records, setRecords] = useState<DailyRecord[]>([]);
   const [segments, setSegments] = useState<Segment[]>([]);
@@ -494,6 +638,84 @@ function App() {
   const [expandedSegments, setExpandedSegments] = useState<Segment[]>([]);
   const [expandedLoading, setExpandedLoading] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
+  // 设置页：搜索关键字、折叠状态、锚点目录
+  const [settingsQuery, setSettingsQuery] = useState("");
+  const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>({});
+  const sectionRefs = useRef<Record<string, HTMLElement | null>>({});
+  const SETTINGS_SECTIONS = useMemo(
+    () => [
+      { id: "sec-general", label: "常用设置", keywords: "离开 开机 自启 菜单栏 主题 外观 尺寸" },
+      { id: "sec-security", label: "应用锁", keywords: "密码 锁定 恢复码 安全" },
+      { id: "sec-schedule", label: "作息时间", keywords: "上班 下班 午休 目标 保留期" },
+      { id: "sec-workday", label: "工作日与节假日", keywords: "工作日 节假日 调休 补班" },
+      { id: "sec-notify", label: "通知与周报", keywords: "通知 提醒 webhook 周报 免打扰" },
+      { id: "sec-privacy", label: "隐私说明", keywords: "隐私 键盘 截图" },
+      { id: "sec-about", label: "关于", keywords: "版本 更新 技术栈 快捷键" },
+      { id: "sec-backup", label: "数据备份与迁移", keywords: "备份 恢复 导出 导入 json 清除" },
+      { id: "sec-logs", label: "运行日志", keywords: "日志 同步 事件" }
+    ],
+    []
+  );
+  const jumpToSection = useCallback((id: string) => {
+    sectionRefs.current[id]?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, []);
+  const toggleSection = useCallback((id: string) => {
+    setCollapsedSections((prev) => ({ ...prev, [id]: !prev[id] }));
+  }, []);
+  const hiddenByQuery = useCallback(
+    (meta: { keywords: string; label: string }) => {
+      const q = settingsQuery.trim().toLowerCase();
+      if (!q) return false;
+      return !(meta.keywords.toLowerCase().includes(q) || meta.label.toLowerCase().includes(q));
+    },
+    [settingsQuery]
+  );
+  const [webhookTesting, setWebhookTesting] = useState(false);
+  const [webhookTestMsg, setWebhookTestMsg] = useState("");
+  const [notifyTesting, setNotifyTesting] = useState(false);
+  const [notifyTestMsg, setNotifyTestMsg] = useState("");
+  const [replayOnboarding, setReplayOnboarding] = useState(false);
+  const [restoreBackupOpen, setRestoreBackupOpen] = useState(false);
+
+  async function testWebhookNow() {
+    if (webhookTesting) return;
+    setWebhookTesting(true);
+    setWebhookTestMsg("");
+    try {
+      await invoke("test_webhook", { url: settingsRef.current.report_webhook });
+      setWebhookTestMsg("测试消息已发送，请到群里确认");
+      pushLog("Webhook 测试推送成功");
+    } catch (err) {
+      setWebhookTestMsg(`推送失败：${err}`);
+    } finally {
+      setWebhookTesting(false);
+    }
+  }
+
+  async function sendNotifyTest() {
+    if (notifyTesting) return;
+    setNotifyTesting(true);
+    setNotifyTestMsg("");
+    try {
+      await invoke("notify_test");
+      setNotifyTestMsg("测试通知已发出，若没看到请检查系统通知权限");
+    } catch (err) {
+      setNotifyTestMsg(`发送失败：${err}（可能未授予通知权限）`);
+    } finally {
+      setNotifyTesting(false);
+    }
+  }
+
+  async function restoreNamed(name: string) {
+    try {
+      const msg = await invoke<string>("restore_named_backup", { name });
+      pushLog(msg);
+      setRestoreBackupOpen(false);
+      await refresh();
+    } catch (err) {
+      pushLog(`备份恢复失败：${err}`);
+    }
+  }
   const [editMode, setEditMode] = useState(false);
   const [editSegments, setEditSegments] = useState<Segment[]>([]);
   const [firstRunTip, setFirstRunTip] = useState(false);
@@ -830,8 +1052,21 @@ function App() {
     if (w >= 960 && h >= 600) {
       win.setSize(new LogicalSize(w, h)).catch(() => {});
     }
+    // 位置记忆：双显示器下也能恢复到上次的位置（含负坐标）
+    if (settingsRef.current.window_pos_set) {
+      win
+        .setPosition(
+          new LogicalPosition(
+            settingsRef.current.window_x,
+            settingsRef.current.window_y
+          )
+        )
+        .catch(() => {});
+    }
     let unlisten: (() => void) | null = null;
+    let unlistenMove: (() => void) | null = null;
     let timer: number | null = null;
+    let posTimer: number | null = null;
     const onResized = async () => {
       try {
         const size = await win.innerSize();
@@ -846,14 +1081,39 @@ function App() {
         // 预览模式无窗口对象
       }
     };
+    const onMoved = async () => {
+      try {
+        const pos = await win.outerPosition();
+        const sf = await win.scaleFactor();
+        const lx = Math.round(pos.x / sf);
+        const ly = Math.round(pos.y / sf);
+        if (posTimer) window.clearTimeout(posTimer);
+        posTimer = window.setTimeout(() => {
+          updateSettingsDebounced({
+            window_x: lx,
+            window_y: ly,
+            window_pos_set: true,
+          });
+        }, 500);
+      } catch {
+        // 预览模式无窗口对象
+      }
+    };
     win.onResized(onResized)
       .then((u) => {
         unlisten = u;
       })
       .catch(() => {});
+    win.onMoved(onMoved)
+      .then((u) => {
+        unlistenMove = u;
+      })
+      .catch(() => {});
     return () => {
       unlisten?.();
+      unlistenMove?.();
       if (timer) window.clearTimeout(timer);
+      if (posTimer) window.clearTimeout(posTimer);
     };
   }, [ready, settings.onboarded]);
 
@@ -1015,12 +1275,7 @@ function App() {
     await refresh();
   }
 
-  async function clearAllRecords() {
-    if (!confirmClear) {
-      setConfirmClear(true);
-      window.setTimeout(() => setConfirmClear(false), 5000);
-      return;
-    }
+  async function doClearAll() {
     setConfirmClear(false);
     try {
       const msg = await invoke<string>("clear_all_records");
@@ -1105,14 +1360,9 @@ function App() {
 
   /**
    * 从服务器补回历史（换机 / 重装 / 误删后的恢复路径）。
-   * 后端只插入本地缺失的日期，不会覆盖本地已有记录；两步点击避免误触。
+   * 后端只插入本地缺失的日期，不会覆盖本地已有记录。
    */
-  async function pullFromServer() {
-    if (!confirmPull) {
-      setConfirmPull(true);
-      setSyncTestResult("再次点击「从服务器恢复」确认：只补本地缺失的日期，不会覆盖已有记录");
-      return;
-    }
+  async function doPullFromServer() {
     setConfirmPull(false);
     setPulling(true);
     try {
@@ -1540,7 +1790,11 @@ function App() {
   if (!ready) {
     return (
       <main className="shell">
-        <section className="workspace loading">加载中…</section>
+        <section className="workspace">
+          <div className="panel" style={{ padding: 20 }}>
+            <Skeleton lines={5} />
+          </div>
+        </section>
       </main>
     );
   }
@@ -1559,6 +1813,17 @@ function App() {
 
   if (!settings.onboarded) {
     return <Onboarding settings={settings} onChange={updateSettingsDebounced} onFinish={finishOnboarding} onLockChanged={(hasPassword) => setAuth({ hasPassword, unlocked: true })} />;
+  }
+
+  if (replayOnboarding) {
+    return (
+      <Onboarding
+        settings={settings}
+        onChange={updateSettingsDebounced}
+        onFinish={() => setReplayOnboarding(false)}
+        onLockChanged={(hasPassword) => setAuth({ hasPassword, unlocked: true })}
+      />
+    );
   }
 
   return (
@@ -1630,8 +1895,8 @@ function App() {
           {page === "records" && (
             <div className="actions">
               {!isPreview && (
+                <Tooltip label={paused ? "恢复记录" : "暂停记录"}>
                 <button
-                  title={paused ? "恢复记录" : "暂停记录"}
                   aria-label={paused ? "恢复记录" : "暂停记录"}
                   aria-pressed={paused}
                   className={paused ? "isPaused" : undefined}
@@ -1639,20 +1904,26 @@ function App() {
                 >
                   {paused ? <Play size={18} /> : <Pause size={18} />}
                 </button>
+                </Tooltip>
               )}
-              <button title="刷新" aria-label="刷新" onClick={refresh}><RefreshCcw size={18} /></button>
-              <button
-                title="导出当月考勤 CSV（含迟到/早退/加班）"
-                aria-label="导出当月考勤 CSV"
-                onClick={exportAttendance}
-              >
-                <CalendarPlus size={18} />
-              </button>
-              <button title="导出 CSV" aria-label="导出 CSV" onClick={exportCsv}><Download size={18} /></button>
+              <Tooltip label="刷新">
+                <button aria-label="刷新" onClick={refresh}><RefreshCcw size={18} /></button>
+              </Tooltip>
+              <Tooltip label="导出当月考勤 CSV（含迟到/早退/加班）">
+                <button
+                  aria-label="导出当月考勤 CSV"
+                  onClick={exportAttendance}
+                >
+                  <CalendarPlus size={18} />
+                </button>
+              </Tooltip>
+              <Tooltip label="导出 CSV">
+                <button aria-label="导出 CSV" onClick={exportCsv}><Download size={18} /></button>
+              </Tooltip>
               {!isPreview && (
                 <div className="focusMenuWrap">
+                  <Tooltip label="会议模式：期间无键鼠输入也按工作计算">
                   <button
-                    title="会议模式：期间无键鼠输入也按工作计算"
                     aria-label="会议模式"
                     aria-expanded={focusMenuOpen}
                     className={focusActive ? "focusActiveBtn" : undefined}
@@ -1660,6 +1931,7 @@ function App() {
                   >
                     <Timer size={18} />
                   </button>
+                  </Tooltip>
                   {focusMenuOpen && (
                     <div className="focusMenu">
                       <span className="focusMenuTitle">会议模式持续</span>
@@ -1693,15 +1965,20 @@ function App() {
           )}
         </header>
 
+        <div key={page} className="pageBody">
         {page === "records" && !today && (
-          <section className="panel firstRecordEmpty">
-            <div className="emptyIcon"><Activity size={26} /></div>
-            <h2>正在等待首次活动记录</h2>
-            <p>保持应用在后台运行，产生键盘或鼠标活动后，这里会自动显示今天的开始时间和工作时段。</p>
-            <div className="emptyActions">
-              <button className="primary" onClick={refresh}><RefreshCcw size={17} />重新检查</button>
-              <button onClick={() => setPage("settings")}><SlidersHorizontal size={17} />检查记录设置</button>
-            </div>
+          <section className="panel">
+            <Empty
+              icon={<Activity size={26} />}
+              title="正在等待首次活动记录"
+              description="保持应用在后台运行，产生键盘或鼠标活动后，这里会自动显示今天的开始时间和工作时段。"
+              action={
+                <>
+                  <button className="primary" onClick={refresh}><RefreshCcw size={17} />重新检查</button>
+                  <button onClick={() => setPage("settings")}><SlidersHorizontal size={17} />检查记录设置</button>
+                </>
+              }
+            />
           </section>
         )}
 
@@ -2268,13 +2545,11 @@ function App() {
                   {manualSyncing ? "同步中…" : "立即同步"}
                 </button>
                 <button
-                  onClick={pullFromServer}
+                  onClick={() => setConfirmPull(true)}
                   disabled={pulling || !settings.sync_enabled}
-                  className={confirmPull ? "dangerBtn confirming" : undefined}
-                  title="换电脑或重装后，从服务器补回本地缺失的历史日汇总"
                 >
                   <Download size={15} />
-                  {pulling ? "恢复中…" : confirmPull ? "确认从服务器恢复" : "从服务器恢复"}
+                  {pulling ? "恢复中…" : "从服务器恢复"}
                 </button>
                 {syncTestResult && (
                   <span className={`syncResult ${syncState}`}>{syncTestResult}</span>
@@ -2298,12 +2573,41 @@ function App() {
 
         {page === "settings" && (
           <>
-            <section className="panel settingsPanel">
+            <div className="settingsNav">
+              <div className="settingsSearch">
+                <Search size={15} />
+                <input
+                  value={settingsQuery}
+                  onChange={(e) => setSettingsQuery(e.target.value)}
+                  placeholder="搜索设置项（如 密码 / 备份 / 通知）"
+                />
+                {settingsQuery && (
+                  <button className="settingsSearchClear" onClick={() => setSettingsQuery("")} aria-label="清除搜索">
+                    <X size={14} />
+                  </button>
+                )}
+              </div>
+              <div className="settingsAnchors">
+                {SETTINGS_SECTIONS.map((s) => (
+                  <button key={s.id} type="button" onClick={() => jumpToSection(s.id)}>
+                    {s.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <section
+              id="sec-general"
+              ref={(el) => { sectionRefs.current["sec-general"] = el; }}
+              className={`panel settingsPanel${collapsedSections["sec-general"] ? " collapsed" : ""}${hiddenByQuery(SETTINGS_SECTIONS[0]) ? " searchHidden" : ""}`}
+            >
               <div className="panelTitle">
                 <div>
                   <h2>常用设置</h2>
                   <p>调整记录规则、外观和后台驻留方式</p>
                 </div>
+                <button type="button" className="collapseBtn" aria-label="折叠/展开" onClick={() => toggleSection("sec-general")}>
+                  <ChevronDown size={17} />
+                </button>
               </div>
               <div className="settingsQuickGrid">
                 <label className="settingGroup idleControl">
@@ -2362,17 +2666,32 @@ function App() {
                 </div>
               </div>
             </section>
+            <div
+              id="sec-security"
+              ref={(el) => { sectionRefs.current["sec-security"] = el; }}
+              className={hiddenByQuery(SETTINGS_SECTIONS[1]) ? "searchHidden" : ""}
+            >
             <SecurityPanel
               hasPassword={auth?.hasPassword ?? false}
               onChanged={(hasPassword) => setAuth({ hasPassword, unlocked: true })}
               pushLog={pushLog}
+              collapsed={!!collapsedSections["sec-security"]}
+              onToggleCollapse={() => toggleSection("sec-security")}
             />
-            <section className="panel">
+            </div>
+            <section
+              id="sec-schedule"
+              ref={(el) => { sectionRefs.current["sec-schedule"] = el; }}
+              className={`panel${collapsedSections["sec-schedule"] ? " collapsed" : ""}${hiddenByQuery(SETTINGS_SECTIONS[2]) ? " searchHidden" : ""}`}
+            >
               <div className="panelTitle">
                 <div>
                   <h2>作息时间</h2>
                   <p>按你的实际上下班与休息时间设置，报表会据此对比</p>
                 </div>
+                <button type="button" className="collapseBtn" aria-label="折叠/展开" onClick={() => toggleSection("sec-schedule")}>
+                  <ChevronDown size={17} />
+                </button>
               </div>
               <div className="scheduleGrid">
                 <label>
@@ -2457,12 +2776,19 @@ function App() {
                 </label>
               </div>
             </section>
-            <section className="panel">
+            <section
+              id="sec-workday"
+              ref={(el) => { sectionRefs.current["sec-workday"] = el; }}
+              className={`panel${collapsedSections["sec-workday"] ? " collapsed" : ""}${hiddenByQuery(SETTINGS_SECTIONS[3]) ? " searchHidden" : ""}`}
+            >
               <div className="panelTitle">
                 <div>
                   <h2>工作日与节假日</h2>
                   <p>决定「哪些天该上班」。达成率、迟到早退和考勤导出都按这里的口径计算</p>
                 </div>
+                <button type="button" className="collapseBtn" aria-label="折叠/展开" onClick={() => toggleSection("sec-workday")}>
+                  <ChevronDown size={17} />
+                </button>
               </div>
               <div className="weekPicker" role="group" aria-label="每周工作日">
                 {[1, 2, 3, 4, 5, 6, 0].map((g) => (
@@ -2505,12 +2831,19 @@ function App() {
                 </label>
               </div>
             </section>
-            <section className="panel">
+            <section
+              id="sec-notify"
+              ref={(el) => { sectionRefs.current["sec-notify"] = el; }}
+              className={`panel${collapsedSections["sec-notify"] ? " collapsed" : ""}${hiddenByQuery(SETTINGS_SECTIONS[4]) ? " searchHidden" : ""}`}
+            >
               <div className="panelTitle">
                 <div>
                   <h2>通知与周报</h2>
                   <p>选择哪些提醒会弹出，并可设置免打扰时段与周报推送</p>
                 </div>
+                <button type="button" className="collapseBtn" aria-label="折叠/展开" onClick={() => toggleSection("sec-notify")}>
+                  <ChevronDown size={17} />
+                </button>
               </div>
               <div className="notifyToggles">
                 <label className="switchRow">
@@ -2561,6 +2894,13 @@ function App() {
               <p className="fieldHint">
                 免打扰时段内所有系统通知静默；开始晚于结束时按跨零点处理（如 22:00–08:00）。
               </p>
+              <div className="inlineTestRow">
+                <button type="button" className="panelBtn" onClick={sendNotifyTest} disabled={notifyTesting}>
+                  {notifyTesting ? <Spinner size={13} /> : <Bell size={14} />}
+                  发送测试通知
+                </button>
+                {notifyTestMsg && <span className="inlineTestMsg">{notifyTestMsg}</span>}
+              </div>
               <label className="webhookRow">
                 <span>周报机器人 Webhook（企业微信 / 飞书 / 钉钉）</span>
                 <input
@@ -2574,14 +2914,28 @@ function App() {
                 <small className="fieldHint">
                   留空不推送；配置后每周一上午 9 点自动发送最近 7 天的工时小结。
                 </small>
+                <div className="inlineTestRow">
+                  <button type="button" className="panelBtn" onClick={testWebhookNow} disabled={webhookTesting || !settings.report_webhook}>
+                    {webhookTesting ? <Spinner size={13} /> : <Send size={14} />}
+                    发送测试消息
+                  </button>
+                  {webhookTestMsg && <span className="inlineTestMsg">{webhookTestMsg}</span>}
+                </div>
               </label>
             </section>
-            <section className="panel">
+            <section
+              id="sec-privacy"
+              ref={(el) => { sectionRefs.current["sec-privacy"] = el; }}
+              className={`panel${collapsedSections["sec-privacy"] ? " collapsed" : ""}${hiddenByQuery(SETTINGS_SECTIONS[5]) ? " searchHidden" : ""}`}
+            >
               <div className="panelTitle">
                 <div>
                   <h2>隐私说明</h2>
                   <p>本软件只判断“有没有操作”，不采集任何内容</p>
                 </div>
+                <button type="button" className="collapseBtn" aria-label="折叠/展开" onClick={() => toggleSection("sec-privacy")}>
+                  <ChevronDown size={17} />
+                </button>
               </div>
               <ul className="privacyList">
                 <li>不读取具体按键，不保存键盘输入内容</li>
@@ -2590,16 +2944,25 @@ function App() {
                 <li>数据保存在本机，只有开启同步后才上传服务器</li>
               </ul>
             </section>
-            <section className="panel">
+            <section
+              id="sec-about"
+              ref={(el) => { sectionRefs.current["sec-about"] = el; }}
+              className={`panel${collapsedSections["sec-about"] ? " collapsed" : ""}${hiddenByQuery(SETTINGS_SECTIONS[6]) ? " searchHidden" : ""}`}
+            >
               <div className="panelTitle">
                 <div>
                   <h2>关于</h2>
                   <p>本地隐私工作记录 · 数据始终保存在本机</p>
                 </div>
+                <div className="panelTitleActions">
                 <button className="panelBtn" onClick={checkForUpdate} disabled={checking}>
                   <RefreshCcw size={14} />
                   {checking ? "检查中…" : "检查更新"}
                 </button>
+                <button type="button" className="collapseBtn" aria-label="折叠/展开" onClick={() => toggleSection("sec-about")}>
+                  <ChevronDown size={17} />
+                </button>
+                </div>
               </div>
               <div className="aboutBox">
                 <div className="aboutRow">
@@ -2670,29 +3033,44 @@ function App() {
                       : updateInfo.notes}
                   </p>
                 )}
+                <div className="formActions aboutActions">
+                  <button type="button" className="panelBtn" onClick={() => setReplayOnboarding(true)}>
+                    <RotateCcw size={14} />回看首次设置向导
+                  </button>
+                </div>
               </div>
             </section>
-            <section className="panel">
+            <section
+              id="sec-backup"
+              ref={(el) => { sectionRefs.current["sec-backup"] = el; }}
+              className={`panel${collapsedSections["sec-backup"] ? " collapsed" : ""}${hiddenByQuery(SETTINGS_SECTIONS[7]) ? " searchHidden" : ""}`}
+            >
               <div className="panelTitle">
                 <div>
                   <h2>数据备份与迁移</h2>
                   <p>换机时先导出备份，再到新机器“恢复备份”即可迁移全部历史</p>
                 </div>
+                <button type="button" className="collapseBtn" aria-label="折叠/展开" onClick={() => toggleSection("sec-backup")}>
+                  <ChevronDown size={17} />
+                </button>
               </div>
               <div className="form">
                 <div className="formActions">
                 <button onClick={backupDb}><Download size={16} />备份数据</button>
                 <button onClick={restoreDb}>恢复备份…</button>
+                <button onClick={() => setRestoreBackupOpen(true)}>
+                  <RotateCcw size={16} />从自动备份恢复
+                </button>
                 <button onClick={exportJson}><FileJson size={16} />导出 JSON</button>
                 <button onClick={importJson}>导入 JSON…</button>
                 <button onClick={openDataDir} title="在文件管理器中打开数据库所在目录">
                   <FolderOpen size={16} />打开数据目录
                 </button>                <button
-                  className={`dangerBtn${confirmClear ? " confirming" : ""}`}
-                  onClick={clearAllRecords}
+                  className="dangerBtn"
+                  onClick={() => setConfirmClear(true)}
                 >
                   <Trash2 size={16} />
-                  {confirmClear ? "再次点击清除全部" : "清除全部记录"}
+                  清除全部记录
                 </button>
               </div>
               {dataPath && <p className="pathLine">数据库位置：{dataPath}</p>}
@@ -2700,12 +3078,19 @@ function App() {
               <p className="hint">清除只删除本机的活动记录，设置与同步配置会保留。</p>
               </div>
             </section>
-            <section className="panel">
+            <section
+              id="sec-logs"
+              ref={(el) => { sectionRefs.current["sec-logs"] = el; }}
+              className={`panel${collapsedSections["sec-logs"] ? " collapsed" : ""}${hiddenByQuery(SETTINGS_SECTIONS[8]) ? " searchHidden" : ""}`}
+            >
               <div className="panelTitle">
                 <div>
                   <h2>运行日志</h2>
                   <p>最近的后台同步、导出与备份事件</p>
                 </div>
+                <button type="button" className="collapseBtn" aria-label="折叠/展开" onClick={() => toggleSection("sec-logs")}>
+                  <ChevronDown size={17} />
+                </button>
               </div>
               <div className="logBox">
                 {logLines.length === 0 && <p className="empty">暂无日志</p>}
@@ -2716,6 +3101,61 @@ function App() {
             </section>
           </>
         )}
+        </div>
+        <Modal
+          open={confirmClear}
+          title="清除全部记录"
+          danger
+          onClose={() => setConfirmClear(false)}
+          footer={
+            <>
+              <button type="button" onClick={() => setConfirmClear(false)}>取消</button>
+              <button type="button" className="dangerBtn" onClick={doClearAll}>
+                <Trash2 size={15} />确认清除
+              </button>
+            </>
+          }
+        >
+          <p>将删除本机全部活动日汇总与时段明细，设置和同步配置会保留。此操作不可撤销，建议先做一次备份。</p>
+        </Modal>
+        <Modal
+          open={confirmPull}
+          title="从服务器恢复"
+          onClose={() => setConfirmPull(false)}
+          footer={
+            <>
+              <button type="button" onClick={() => setConfirmPull(false)}>取消</button>
+              <button type="button" className="primary" onClick={doPullFromServer} disabled={pulling}>
+                {pulling ? <Spinner size={14} /> : <Download size={15} />}确认恢复
+              </button>
+            </>
+          }
+        >
+          <p>从同步服务器拉取最近 365 天的数据，只补回本地缺失的日期和时段，不会覆盖或删除已有记录。</p>
+        </Modal>
+        <Modal
+          open={restoreBackupOpen}
+          title="从自动备份恢复"
+          danger
+          onClose={() => setRestoreBackupOpen(false)}
+          footer={
+            <button type="button" onClick={() => setRestoreBackupOpen(false)}>取消</button>
+          }
+        >
+          {backupFiles.length === 0 ? (
+            <p>暂无自动备份，可先点「备份数据」创建一份。</p>
+          ) : (
+            <div className="backupPickList">
+              {backupFiles.map((f) => (
+                <button key={f.name} type="button" className="backupPickItem" onClick={() => restoreNamed(f.name)}>
+                  <span className="backupPickName"><RotateCcw size={14} />{f.name}</span>
+                  <span className="backupPickMeta">{f.modified} · {(f.size / 1024).toFixed(0)} KB</span>
+                </button>
+              ))}
+            </div>
+          )}
+          <p className="fieldHint" style={{ marginTop: 10 }}>恢复会用所选备份替换当前数据库，操作前建议再做一次备份。</p>
+        </Modal>
         {saveFeedback && (
           <div className={`saveToast ${saveFeedback.state}`} role="status" aria-live="polite">
             <span className="toastDot" />
@@ -2803,12 +3243,12 @@ function LockScreen({ onUnlocked }: { onUnlocked: () => void }) {
           <>
             <label className="lockField">
               <span>密码</span>
-              <input
-                type="password"
+              <PasswordInput
                 autoFocus
                 value={password}
-                onChange={(event) => setPassword(event.target.value)}
+                onChange={setPassword}
                 placeholder="输入应用锁密码"
+                autoComplete="current-password"
               />
             </label>
             {error && <p className="lockError">{error}</p>}
@@ -2840,10 +3280,10 @@ function LockScreen({ onUnlocked }: { onUnlocked: () => void }) {
             </label>
             <label className="lockField">
               <span>新密码（至少 6 位）</span>
-              <input
-                type="password"
+              <PasswordInput
                 value={next}
-                onChange={(event) => setNext(event.target.value)}
+                onChange={setNext}
+                autoComplete="new-password"
               />
             </label>
             {error && <p className="lockError">{error}</p>}
@@ -2870,11 +3310,15 @@ function LockScreen({ onUnlocked }: { onUnlocked: () => void }) {
 function SecurityPanel({
   hasPassword,
   onChanged,
-  pushLog
+  pushLog,
+  collapsed,
+  onToggleCollapse
 }: {
   hasPassword: boolean;
   onChanged: (hasPassword: boolean) => void;
   pushLog: (message: string) => void;
+  collapsed?: boolean;
+  onToggleCollapse?: () => void;
 }) {
   const [current, setCurrent] = useState("");
   const [next, setNext] = useState("");
@@ -2927,7 +3371,7 @@ function SecurityPanel({
   }
 
   return (
-    <section className="panel">
+    <section className={`panel${collapsed ? " collapsed" : ""}`}>
       <div className="panelTitle">
         <div>
           <h2>应用锁</h2>
@@ -2937,35 +3381,39 @@ function SecurityPanel({
               : "开启后，打开应用或从托盘唤出都需要先输入密码"}
           </p>
         </div>
+        {onToggleCollapse && (
+          <button type="button" className="collapseBtn" aria-label="折叠/展开" onClick={onToggleCollapse}>
+            <ChevronDown size={17} />
+          </button>
+        )}
       </div>
       <form className="form" onSubmit={submit}>
         {hasPassword && (
           <label>
             <span>当前密码</span>
-            <input
-              type="password"
+            <PasswordInput
               value={current}
-              onChange={(event) => setCurrent(event.target.value)}
+              onChange={setCurrent}
               autoComplete="current-password"
             />
           </label>
         )}
         <label>
           <span>{hasPassword ? "新密码" : "设置密码（至少 6 位）"}</span>
-          <input
-            type="password"
+          <PasswordInput
             value={next}
-            onChange={(event) => setNext(event.target.value)}
+            onChange={setNext}
             autoComplete="new-password"
+            invalid={!!error}
           />
         </label>
         <label>
           <span>确认密码</span>
-          <input
-            type="password"
+          <PasswordInput
             value={confirm}
-            onChange={(event) => setConfirm(event.target.value)}
+            onChange={setConfirm}
             autoComplete="new-password"
+            invalid={!!error}
           />
         </label>
         {error && <p className="lockError">{error}</p>}
@@ -3147,20 +3595,20 @@ function Onboarding({
               <div className="form">
                 <label>
                   <span>设置密码（至少 6 位）</span>
-                  <input
-                    type="password"
+                  <PasswordInput
                     value={lockPassword}
-                    onChange={(event) => setLockPassword(event.target.value)}
+                    onChange={setLockPassword}
                     autoComplete="new-password"
+                    invalid={!!lockError}
                   />
                 </label>
                 <label>
                   <span>确认密码</span>
-                  <input
-                    type="password"
+                  <PasswordInput
                     value={lockConfirm}
-                    onChange={(event) => setLockConfirm(event.target.value)}
+                    onChange={setLockConfirm}
                     autoComplete="new-password"
+                    invalid={!!lockError}
                   />
                 </label>
                 {lockError && <p className="lockError">{lockError}</p>}

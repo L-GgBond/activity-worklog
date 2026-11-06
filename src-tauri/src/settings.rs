@@ -27,6 +27,13 @@ pub struct AppSettings {
     pub window_width: u32,
     #[serde(default)]
     pub window_height: u32,
+    // 窗口位置记忆：window_pos_set 为 true 时启动后恢复到 (window_x, window_y)
+    #[serde(default)]
+    pub window_x: i32,
+    #[serde(default)]
+    pub window_y: i32,
+    #[serde(default)]
+    pub window_pos_set: bool,
     // 外观主题：system / light / dark
     #[serde(default = "default_theme")]
     pub theme: String,
@@ -136,6 +143,9 @@ impl Default for AppSettings {
             lunch_end: default_lunch_end(),
             window_width: 0,
             window_height: 0,
+            window_x: 0,
+            window_y: 0,
+            window_pos_set: false,
             theme: default_theme(),
             daily_target_minutes: default_daily_target(),
             retention_days: 0,

@@ -449,6 +449,77 @@ fn list_backups(state: State<AppState>) -> Result<Vec<BackupFile>, String> {
         .collect())
 }
 
+/// 从自动备份列表中选一份直接恢复（不用再走文件选择器）。
+#[tauri::command]
+fn restore_named_backup(app: AppHandle, name: String) -> Result<String, String> {
+    let state = app.state::<AppState>();
+    ensure_unlocked(&state)?;
+    {
+        let mut store = state
+            .store
+            .lock()
+            .map_err(|_| "store lock failed".to_string())?;
+        store
+            .restore_named_backup(&name)
+            .map_err(|err| err.to_string())?;
+    }
+    state.resetting.store(2, Ordering::Relaxed);
+    notify(&app, "已从备份恢复，列表已刷新");
+    logging::write("INFO", &format!("从备份 {name} 恢复成功"));
+    Ok("已从备份恢复，列表已刷新".into())
+}
+
+/// 发送一条测试通知，同时用来检测系统通知权限是否已授予。
+#[tauri::command]
+fn notify_test(app: AppHandle) -> Result<(), String> {
+    let shown = app
+        .notification()
+        .builder()
+        .title("Activity Worklog")
+        .body("这是一条测试通知，能看到说明通知权限正常")
+        .show();
+    shown.map_err(|err| {
+        logging::write("WARN", &format!("测试通知发送失败: {err}"));
+        err.to_string()
+    })
+}
+
+/// 向配置的周报 Webhook 发送一条测试消息，避免地址配错等一周才发现。
+#[tauri::command]
+async fn test_webhook(url: String) -> Result<(), String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return Err("Webhook 地址为空".into());
+    }
+    if !trimmed.starts_with("https://") && !trimmed.starts_with("http://") {
+        return Err("地址必须以 http:// 或 https:// 开头".into());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|err| err.to_string())?;
+    let text = "Activity Worklog 测试消息：周报推送地址配置正常".to_string();
+    let payload = serde_json::json!({
+        "msgtype": "text",
+        "msg_type": "text",
+        "text": {"content": text},
+        "content": {"text": text},
+    });
+    let response = client
+        .post(trimmed)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|err| format!("推送失败：{err}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("服务器返回 {status}：{body}"));
+    }
+    logging::write("INFO", "Webhook 测试推送成功");
+    Ok(())
+}
+
 #[tauri::command]
 fn export_db(app: AppHandle) -> Result<String, String> {
     let state = app.state::<AppState>();
@@ -1769,7 +1840,10 @@ fn main() {
             install_update,
             set_focus_mode,
             focus_deadline,
-            list_backups
+            list_backups,
+            restore_named_backup,
+            notify_test,
+            test_webhook
         ])
         .build(tauri::generate_context!())
         .expect("failed to build app")

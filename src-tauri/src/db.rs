@@ -860,6 +860,21 @@ impl Store {
         Ok(dest)
     }
 
+    /// 从自动备份目录中按文件名恢复（供数据健康面板直接选择）。
+    /// 文件名做白名单校验，杜绝路径穿越。
+    pub fn restore_named_backup(&mut self, name: &str) -> anyhow::Result<()> {
+        if name.is_empty()
+            || name.contains('/')
+            || name.contains('\\')
+            || name.contains("..")
+            || name.contains('\0')
+        {
+            anyhow::bail!("非法备份文件名");
+        }
+        let source = self.data_dir.join("backups").join(name);
+        self.restore_from(&source)
+    }
+
     /// 用备份文件替换当前数据库：校验 → 归一化快照 → 断开旧句柄 → 清理 WAL → 覆盖 → 重开。
     ///
     /// 两个必须处理的坑：
