@@ -134,6 +134,47 @@ impl HttpSyncClient {
             .collect())
     }
 
+    /// 把本地删除的日期同步到服务器，避免换机恢复时把已删掉的记录又拉回来。
+    pub async fn delete_records(
+        &self,
+        settings: &AppSettings,
+        dates: Vec<String>,
+    ) -> anyhow::Result<Vec<String>> {
+        if dates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let url = normalize_url(&settings.sync_url);
+        if url.is_empty() {
+            anyhow::bail!("未配置同步服务器地址");
+        }
+        let endpoint = format!("{url}/api/sync/delete");
+        let payload = serde_json::json!({
+            "device_id": device_id(),
+            "dates": dates,
+        });
+        let mut request = self.client.post(&endpoint).json(&payload);
+        if !settings.sync_token.is_empty() {
+            request = request.bearer_auth(&settings.sync_token);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("删除同步失败，服务器返回 {status}: {body}");
+        }
+        let deleted = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| value.get("deleted").and_then(|item| item.as_array()))
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(|value| value.to_string()))
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default();
+        Ok(deleted)
+    }
+
     /// 测试连接：GET /api/health，校验 Token 与服务可达性。
     pub async fn test_connection(&self, settings: &AppSettings) -> anyhow::Result<String> {
         let url = normalize_url(&settings.sync_url);

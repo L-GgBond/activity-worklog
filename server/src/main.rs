@@ -33,6 +33,14 @@ struct SyncPayload {
     records: Vec<DailyRecordDto>,
 }
 
+/// 客户端删除某几天记录后，把日期同步过来，避免换机恢复时又把它们拉回去。
+#[derive(Debug, Deserialize)]
+struct DeletePayload {
+    #[serde(default)]
+    device_id: String,
+    dates: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct ReportRow {
     period: String,
@@ -193,6 +201,29 @@ async fn sync_records(
         accepted.push(record.date.clone());
     }
     Ok(Json(serde_json::json!({ "accepted": accepted })))
+}
+
+/// 删除服务器上的指定日期记录：客户端本地删除后调用，保证恢复历史时不会把删掉的日期拉回来。
+async fn delete_records(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<DeletePayload>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    authorize(&headers, &state.token)?;
+    let conn = state.conn.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut deleted: Vec<String> = Vec::new();
+    for date in &payload.dates {
+        if NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err() {
+            continue;
+        }
+        conn.execute(
+            "delete from synced_records where date = ?1",
+            params![date],
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        deleted.push(date.clone());
+    }
+    Ok(Json(serde_json::json!({ "deleted": deleted })))
 }
 
 fn query_rows(
@@ -423,6 +454,7 @@ async fn main() {
         .route("/", get(dashboard))
         .route("/api/health", get(health))
         .route("/api/sync/records", post(sync_records).get(pull_records))
+        .route("/api/sync/delete", post(delete_records))
         .route("/api/reports/daily", get(daily_report))
         .route("/api/reports/weekly", get(weekly_report))
         .route("/api/reports/monthly", get(monthly_report))

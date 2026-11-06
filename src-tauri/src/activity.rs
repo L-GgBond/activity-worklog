@@ -68,7 +68,28 @@ fn platform_idle_duration() -> anyhow::Result<Duration> {
     }
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+/// Linux：调用 X11 的 xprintidle（毫秒）拿系统空闲时长。
+/// Wayland 会话没有该工具、或未安装 xprintidle 时返回 0，等价于“一直在活动”，
+/// 对应设置里的「无法检测离开」提示，而不是静默算成离开。
+#[cfg(all(unix, not(target_os = "macos")))]
+fn platform_idle_duration() -> anyhow::Result<Duration> {
+    use std::process::Command;
+
+    if std::env::var_os("DISPLAY").is_none() {
+        return Ok(Duration::from_secs(0));
+    }
+    let output = match Command::new("xprintidle").output() {
+        Ok(output) if output.status.success() => output,
+        _ => return Ok(Duration::from_secs(0)),
+    };
+    let idle_ms = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0);
+    Ok(Duration::from_millis(idle_ms))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn platform_idle_duration() -> anyhow::Result<Duration> {
     Ok(Duration::from_secs(0))
 }

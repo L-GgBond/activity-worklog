@@ -64,6 +64,12 @@ type Settings = {
   daily_target_minutes: number;
   retention_days: number;
   menubar_only: boolean;
+  /** 每周工作日：0=周日 … 6=周六（默认周一至周五） */
+  workdays: number[];
+  /** 法定节假日 YYYY-MM-DD，不计入工作日达成率 */
+  holidays: string[];
+  /** 调休补班日 YYYY-MM-DD，按工作日统计 */
+  makeup_days: string[];
 };
 
 type Page = "records" | "analytics" | "sync" | "settings";
@@ -96,7 +102,10 @@ const defaultSettings: Settings = {
   theme: "system",
   daily_target_minutes: 480,
   retention_days: 0,
-  menubar_only: false
+  menubar_only: false,
+  workdays: [1, 2, 3, 4, 5],
+  holidays: [],
+  makeup_days: []
 };
 
 /** 是否运行在 Tauri 桌面容器内（纯浏览器打开时为 false，用于界面预览） */
@@ -266,7 +275,8 @@ function csvCell(value: string | number) {
 /**
  * 月度考勤 CSV：给用户自己核对或交给 HR 的表格。
  * 与「导出全部记录」不同，这里按自然月出表，并直接算出迟到 / 早退 / 加班分钟数，
- * 免去在 Excel 里再写一遍公式。周末行会标注，便于区分调休与加班。
+ * 免去在 Excel 里再写一遍公式。非工作日（节假日 / 非排班日）不迟到早退，
+ * 调休补班日按工作日算，并在备注里标出来。
  */
 function buildAttendanceCsv(records: DailyRecord[], month: string, settings: Settings) {
   const ws = parseHM(settings.work_start);
@@ -292,19 +302,23 @@ function buildAttendanceCsv(records: DailyRecord[], month: string, settings: Set
   let totalOvertime = 0;
   for (const record of sorted) {
     const weekday = new Date(`${record.date}T00:00:00`).getDay();
-    const isWeekend = weekday === 0 || weekday === 6;
+    const workday = isWorkdayKey(record.date, settings);
     const hasRecord = record.active_minutes + record.idle_minutes > 0;
     const startSec = record.first_activity_at ? parseHM(record.first_activity_at) : null;
     const endSec = record.last_activity_at ? parseHM(record.last_activity_at) : null;
-    // 周末不计算迟到/早退（不是应到岗日），但加班照常统计
+    // 非工作日不计算迟到/早退（不是应到岗日），但加班照常统计
     const late =
-      !isWeekend && startSec !== null ? Math.max(0, Math.round((startSec - ws) / 60)) : 0;
+      workday && startSec !== null ? Math.max(0, Math.round((startSec - ws) / 60)) : 0;
     const early =
-      !isWeekend && endSec !== null ? Math.max(0, Math.round((we - endSec) / 60)) : 0;
+      workday && endSec !== null ? Math.max(0, Math.round((we - endSec) / 60)) : 0;
     const overtime = endSec !== null ? Math.max(0, Math.round((endSec - we) / 60)) : 0;
     const notes: string[] = [];
     if (!hasRecord) notes.push("无活动记录");
-    if (isWeekend) notes.push("周末");
+    if (!workday) {
+      notes.push(settings.holidays.includes(record.date) ? "节假日" : "非工作日");
+    } else if (settings.makeup_days.includes(record.date)) {
+      notes.push("调休补班");
+    }
     if (late >= 30) notes.push("迟到");
     if (early >= 30) notes.push("早退");
     if (overtime >= 30) notes.push("加班");
@@ -349,6 +363,79 @@ function buildAttendanceCsv(records: DailyRecord[], month: string, settings: Set
   return lines.join("\r\n");
 }
 
+/** 桌面端返回的设置可能来自旧版本（缺新增字段），这里补齐后再交给界面 */
+function normalizeSettings(raw: Settings): Settings {
+  const merged = { ...defaultSettings, ...raw };
+  return {
+    ...merged,
+    workdays:
+      Array.isArray(merged.workdays) && merged.workdays.length > 0
+        ? merged.workdays
+        : defaultSettings.workdays,
+    holidays: Array.isArray(merged.holidays) ? merged.holidays : [],
+    makeup_days: Array.isArray(merged.makeup_days) ? merged.makeup_days : []
+  };
+}
+
+/**
+ * 某一天是否算工作日：调休补班优先，其次法定节假日，最后看每周工作日设置。
+ * 报表里的达成率、迟到早退、考勤 CSV 都要走这个函数，避免各算各的。
+ */
+function isWorkdayKey(key: string, settings: Settings) {
+  if (settings.makeup_days.includes(key)) return true;
+  if (settings.holidays.includes(key)) return false;
+  const weekday = new Date(`${key}T00:00:00`).getDay();
+  return settings.workdays.includes(weekday);
+}
+
+/** 把多行/逗号分隔的日期文本解析成 YYYY-MM-DD 列表，非法项直接丢掉 */
+function parseDateList(text: string) {
+  return text
+    .split(/[\s,，、;；]+/)
+    .map((item) => item.trim())
+    .filter((item) => /^\d{4}-\d{2}-\d{2}$/.test(item))
+    .filter((item, index, arr) => arr.indexOf(item) === index)
+    .sort();
+}
+
+/** 节假日 / 补班日编辑器：输入时保留原始文本，失焦才落库，避免边打字边被重排 */
+function DateListEditor({
+  values,
+  placeholder,
+  onCommit
+}: {
+  values: string[];
+  placeholder: string;
+  onCommit: (list: string[]) => void;
+}) {
+  const [draft, setDraft] = useState(values.join("\n"));
+  const savedRef = useRef(values.join("\n"));
+  useEffect(() => {
+    const next = values.join("\n");
+    // 外部（例如恢复默认 / 同步）改了值才覆盖草稿，否则会打断正在输入的内容
+    if (next !== savedRef.current) {
+      savedRef.current = next;
+      setDraft(next);
+    }
+  }, [values]);
+  return (
+    <textarea
+      className="dateListInput"
+      rows={4}
+      spellCheck={false}
+      placeholder={placeholder}
+      value={draft}
+      onChange={(event) => setDraft(event.target.value)}
+      onBlur={() => {
+        const list = parseDateList(draft);
+        savedRef.current = list.join("\n");
+        setDraft(list.join("\n"));
+        onCommit(list);
+      }}
+    />
+  );
+}
+
 function App() {
   const [records, setRecords] = useState<DailyRecord[]>([]);
   const [segments, setSegments] = useState<Segment[]>([]);
@@ -371,6 +458,8 @@ function App() {
     url: string | null;
   } | null>(null);
   const [checking, setChecking] = useState(false);
+  const [installing, setInstalling] = useState(false);
+  const [installNote, setInstallNote] = useState("");
   const [paused, setPaused] = useState(false);
   const [syncInfo, setSyncInfo] = useState<SyncSummary | null>(null);
   const [manualSyncing, setManualSyncing] = useState(false);
@@ -484,7 +573,8 @@ function App() {
         invoke<number>("count_daily_records").catch(() => 0)
       ]);
       setRecords(loadedRecords);
-      setSettings(loadedSettings);
+      const normalized = normalizeSettings(loadedSettings);
+      setSettings(normalized);
       setSyncInfo(loadedSync);
       setTotalCount(Number(total) || loadedRecords.length);
       setIsPreview(false);
@@ -496,7 +586,7 @@ function App() {
             : "后台监听已开启"
           : prev
       );
-      return loadedSettings;
+      return normalized;
     } catch {
       setIsPreview(true);
       if (inTauri) {
@@ -1138,8 +1228,7 @@ function App() {
     for (let offset = 1; offset <= 30; offset += 1) {
       const day = new Date(now.getFullYear(), now.getMonth(), now.getDate() - offset);
       const key = dateKey(day);
-      const weekend = day.getDay() === 0 || day.getDay() === 6;
-      if (!existing.has(key) && !weekend) {
+      if (!existing.has(key) && isWorkdayKey(key, settings)) {
         initial = key;
         break;
       }
@@ -1247,6 +1336,27 @@ function App() {
     }
   }
 
+  /** 一键安装：桌面端由 Rust 侧下载并校验签名，Windows 会自行退出重启，macOS/Linux 安装后重启 */
+  async function installUpdate() {
+    setInstallNote("");
+    if (!inTauri) {
+      setInstallNote("预览模式：安装更新需要在桌面端运行");
+      return;
+    }
+    setInstalling(true);
+    setInstallNote("正在下载更新包，完成后应用会自动重启…");
+    try {
+      const message = await invoke<string>("install_update");
+      setInstallNote(message || "更新已安装");
+      pushLog("更新已安装");
+    } catch (err) {
+      setInstallNote(`安装失败：${err}`);
+      pushLog(`安装更新失败：${err}`);
+    } finally {
+      setInstalling(false);
+    }
+  }
+
   useEffect(() => {
     let unlisten: (() => void) | null = null;
     (async () => {
@@ -1312,7 +1422,7 @@ function App() {
   }
 
   if (!settings.onboarded) {
-    return <Onboarding settings={settings} onChange={updateSettingsDebounced} onFinish={finishOnboarding} />;
+    return <Onboarding settings={settings} onChange={updateSettingsDebounced} onFinish={finishOnboarding} onLockChanged={(hasPassword) => setAuth({ hasPassword, unlocked: true })} />;
   }
 
   return (
@@ -2123,6 +2233,54 @@ function App() {
             <section className="panel">
               <div className="panelTitle">
                 <div>
+                  <h2>工作日与节假日</h2>
+                  <p>决定「哪些天该上班」。达成率、迟到早退和考勤导出都按这里的口径计算</p>
+                </div>
+              </div>
+              <div className="weekPicker" role="group" aria-label="每周工作日">
+                {[1, 2, 3, 4, 5, 6, 0].map((g) => (
+                  <button
+                    key={g}
+                    type="button"
+                    className={settings.workdays.includes(g) ? "weekChip active" : "weekChip"}
+                    onClick={() => {
+                      const next = settings.workdays.includes(g)
+                        ? settings.workdays.filter((item) => item !== g)
+                        : [...settings.workdays, g].sort((a, b) => a - b);
+                      updateSettings({ workdays: next });
+                    }}
+                  >
+                    {WEEKDAY_NAMES[g]}
+                  </button>
+                ))}
+              </div>
+              <p className="fieldHint">
+                默认周一至周五。只点你实际上班的日子；某天既不在工作日里、又被下面标成「调休补班」时，按补班处理。
+              </p>
+              <div className="scheduleGrid holidayGrid">
+                <label>
+                  <span>法定节假日（不计达成）</span>
+                  <DateListEditor
+                    values={settings.holidays}
+                    placeholder={"2026-10-01\n2026-10-02"}
+                    onCommit={(list) => updateSettings({ holidays: list })}
+                  />
+                  <small className="fieldHint">每行一个 YYYY-MM-DD；这些天即使有活动也不算迟到早退</small>
+                </label>
+                <label>
+                  <span>调休补班日（按工作日算）</span>
+                  <DateListEditor
+                    values={settings.makeup_days}
+                    placeholder={"2026-10-11"}
+                    onCommit={(list) => updateSettings({ makeup_days: list })}
+                  />
+                  <small className="fieldHint">周末上班、公司安排补班的日子，填进来就当正常工作日统计</small>
+                </label>
+              </div>
+            </section>
+            <section className="panel">
+              <div className="panelTitle">
+                <div>
                   <h2>隐私说明</h2>
                   <p>本软件只判断“有没有操作”，不采集任何内容</p>
                 </div>
@@ -2172,6 +2330,13 @@ function App() {
                       发现新版本 {updateInfo.latest}（当前 {updateInfo.current}）
                     </p>
                     {updateInfo.notes && <p className="updateNotes">{updateInfo.notes}</p>}
+                    <div className="formActions">
+                      <button className="primary" onClick={installUpdate} disabled={installing}>
+                        <Download size={15} />
+                        {installing ? "下载中…" : "一键下载并安装"}
+                      </button>
+                    </div>
+                    {installNote && <p className="updateNotes">{installNote}</p>}
                     {updateInfo.url && (() => {
                       const releaseUrl = updateInfo.url.replace(
                         /releases\/download\/(v[^\/]+)\/.*/,
@@ -2525,14 +2690,49 @@ function SecurityPanel({
 function Onboarding({
   settings,
   onChange,
-  onFinish
+  onFinish,
+  onLockChanged
 }: {
   settings: Settings;
   onChange: (next: Partial<Settings>, silent?: boolean) => Promise<Settings>;
   onFinish: () => void;
+  onLockChanged: (hasPassword: boolean) => void;
 }) {
   const [step, setStep] = useState(0);
-  const steps = ["隐私说明", "数据同步", "开机自启"];
+  const steps = ["隐私说明", "数据同步", "开机自启", "应用锁"];
+  const [lockPassword, setLockPassword] = useState("");
+  const [lockConfirm, setLockConfirm] = useState("");
+  const [lockBusy, setLockBusy] = useState(false);
+  const [lockError, setLockError] = useState("");
+  const [recoveryCode, setRecoveryCode] = useState("");
+
+  async function enableLock() {
+    setLockError("");
+    if (lockPassword.length < 6) {
+      setLockError("密码至少 6 位");
+      return;
+    }
+    if (lockPassword !== lockConfirm) {
+      setLockError("两次输入的密码不一致");
+      return;
+    }
+    setLockBusy(true);
+    try {
+      if (!inTauri) {
+        setLockError("预览模式：应用锁需要在桌面端设置");
+        return;
+      }
+      const code = await invoke<string>("set_password", { current: "", next: lockPassword });
+      setRecoveryCode(code);
+      setLockPassword("");
+      setLockConfirm("");
+      onLockChanged(true);
+    } catch (err) {
+      setLockError(String(err));
+    } finally {
+      setLockBusy(false);
+    }
+  }
 
   return (
     <main className="wizard">
@@ -2619,6 +2819,57 @@ function Onboarding({
                 <span className="switchTrack" aria-hidden="true" />
               </label>
             </div>
+          </div>
+        )}
+
+        {step === 3 && (
+          <div className="wizardBody">
+            <h2>要不要加一把应用锁</h2>
+            <p className="hint">
+              开启后每次打开应用需先输密码，防止别人看到你的工时记录。也可以先跳过，之后在设置页开启。
+            </p>
+            {recoveryCode ? (
+              <div className="recoveryBox">
+                <p>应用锁已开启。恢复码（只显示这一次，请立刻抄下来保存）：</p>
+                <code>{recoveryCode}</code>
+                <p className="hint">忘记密码时用它重设；也可以点下方「完成设置」直接进入应用。</p>
+              </div>
+            ) : (
+              <div className="form">
+                <label>
+                  <span>设置密码（至少 6 位）</span>
+                  <input
+                    type="password"
+                    value={lockPassword}
+                    onChange={(event) => setLockPassword(event.target.value)}
+                    autoComplete="new-password"
+                  />
+                </label>
+                <label>
+                  <span>确认密码</span>
+                  <input
+                    type="password"
+                    value={lockConfirm}
+                    onChange={(event) => setLockConfirm(event.target.value)}
+                    autoComplete="new-password"
+                  />
+                </label>
+                {lockError && <p className="lockError">{lockError}</p>}
+                <div className="formActions">
+                  <button
+                    className="primary"
+                    type="button"
+                    onClick={enableLock}
+                    disabled={lockBusy}
+                  >
+                    {lockBusy ? "处理中…" : "启用应用锁"}
+                  </button>
+                  <button type="button" onClick={onFinish}>
+                    暂时跳过，直接完成
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -3033,22 +3284,15 @@ function AnalyticsPage({
       d.last_activity_at && (!best || d.last_activity_at > best) ? d.last_activity_at : best,
     null
   );
-  // 达标 / 早退只按工作日算，周末加班或早收工不该进这两项
-  const activeWorkdays = activeDays.filter((d) => {
-    const weekday = new Date(`${d.date}T00:00:00`).getDay();
-    return weekday !== 0 && weekday !== 6;
-  });
+  // 达标 / 早退只按工作日算，节假日不排班、周末加班或早收工不该进这两项
+  const activeWorkdays = activeDays.filter((d) => isWorkdayKey(d.date, settings));
   const overTarget =
     target > 0 ? activeWorkdays.filter((d) => d.active_minutes >= target).length : 0;
   const earlyOff = activeWorkdays.filter(
     (d) => d.last_activity_at && parseHM(d.last_activity_at) < parseHM(settings.work_end)
   ).length;
 
-  const isWeekend = (date: string) => {
-    const g = new Date(`${date}T00:00:00`).getDay();
-    return g === 0 || g === 6;
-  };
-  const workdays = slice.filter((d) => !isWeekend(d.date));
+  const workdays = slice.filter((d) => isWorkdayKey(d.date, settings));
   const starts = workdays
     .filter((d) => d.first_activity_at)
     .map((d) => parseHM(d.first_activity_at as string));
@@ -3085,10 +3329,7 @@ function AnalyticsPage({
   const wsT = parseHM(settings.work_start);
   const weT = parseHM(settings.work_end);
   const achieveOf = (arr: DailyRecord[]) => {
-    const wd = arr.filter((d) => {
-      const g = new Date(`${d.date}T00:00:00`).getDay();
-      return g !== 0 && g !== 6;
-    });
+    const wd = arr.filter((d) => isWorkdayKey(d.date, settings));
     if (!wd.length) return null;
     const hit = wd.filter(
       (d) =>
@@ -3269,6 +3510,26 @@ function AnalyticsPage({
       <section className="panel">
         <div className="panelTitle">
           <div>
+            <h2>日历热图</h2>
+            <p>最近三个月每天有多活跃，一眼看出连休、断更和连续加班</p>
+          </div>
+        </div>
+        <div className="chartCard">
+          <CalendarHeatmap records={data} settings={settings} />
+          <div className="calLegend">
+            <span>少</span>
+            {[0, 1, 2, 3, 4].map((lv) => (
+              <i key={lv} className={`calL${lv}`} />
+            ))}
+            <span>多</span>
+            <em>带虚线的格子是休息日</em>
+          </div>
+        </div>
+      </section>
+
+      <section className="panel">
+        <div className="panelTitle">
+          <div>
             <h2>星期分布</h2>
             <p>一周各天平均活跃时长</p>
           </div>
@@ -3366,6 +3627,75 @@ function WeekdayChart({ records }: { records: DailyRecord[] }) {
         );
       })}
     </svg>
+    </div>
+  );
+}
+
+const pad2 = (value: number) => String(value).padStart(2, "0");
+
+/** 最近三个月日历热图：格子颜色=当天活跃时长，虚线格=休息日 */
+function CalendarHeatmap({ records, settings }: { records: DailyRecord[]; settings: Settings }) {
+  const byDate = new Map(records.map((record) => [record.date, record]));
+  const today = new Date();
+  const max = Math.max(...records.map((record) => record.active_minutes), 60);
+  const levelOf = (minutes: number) => {
+    if (minutes <= 0) return 0;
+    if (minutes <= max / 4) return 1;
+    if (minutes <= max / 2) return 2;
+    if (minutes <= (max * 3) / 4) return 3;
+    return 4;
+  };
+  const months = [2, 1, 0].map(
+    (offset) => new Date(today.getFullYear(), today.getMonth() - offset, 1)
+  );
+  const weekdayNames = ["日", "一", "二", "三", "四", "五", "六"];
+
+  return (
+    <div className="calHeatWrap">
+      {months.map((month) => {
+        const year = month.getFullYear();
+        const monthIndex = month.getMonth();
+        const daysInMonth = new Date(year, monthIndex + 1, 0).getDate();
+        const lead = new Date(year, monthIndex, 1).getDay();
+        const keyOf = (day: number) =>
+          `${year}-${pad2(monthIndex + 1)}-${pad2(day)}`;
+        return (
+          <div className="calMonth" key={`${year}-${monthIndex}`}>
+            <h4>
+              {year} 年 {monthIndex + 1} 月
+            </h4>
+            <div className="calHead">
+              {weekdayNames.map((name) => (
+                <span key={name}>{name}</span>
+              ))}
+            </div>
+            <div className="calGrid">
+              {Array.from({ length: lead }).map((_, index) => (
+                <span key={`blank-${index}`} className="calBlank" />
+              ))}
+              {Array.from({ length: daysInMonth }).map((_, index) => {
+                const day = index + 1;
+                const key = keyOf(day);
+                const record = byDate.get(key);
+                const workday = isWorkdayKey(key, settings);
+                const level = record ? levelOf(record.active_minutes) : 0;
+                const text = record
+                  ? `${(record.active_minutes / 60).toFixed(1)} 小时`
+                  : "无记录";
+                return (
+                  <span
+                    key={key}
+                    className={`calCell calL${level}${workday ? "" : " off"}`}
+                    title={`${key} · ${workday ? "工作日" : "休息日"} · ${text}`}
+                  >
+                    {day}
+                  </span>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }

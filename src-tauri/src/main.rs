@@ -318,7 +318,11 @@ fn save_settings(
 }
 
 #[tauri::command]
-fn delete_day(app: AppHandle, state: State<AppState>, date: String) -> Result<(), String> {
+async fn delete_day(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    date: String,
+) -> Result<(), String> {
     ensure_unlocked(&state)?;
     state
         .store
@@ -331,6 +335,27 @@ fn delete_day(app: AppHandle, state: State<AppState>, date: String) -> Result<()
         state.resetting.store(1, Ordering::Relaxed);
     }
     let _ = app.emit("records-updated", ());
+
+    // 同步删除到服务器：否则下次「从服务器恢复」会把刚删掉的那天又拉回来。
+    // 失败只打日志、不影响本地删除，等用户下次手动同步再处理。
+    let settings = {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| "store lock failed".to_string())?;
+        store.get_settings().ok()
+    };
+    if let Some(settings) = settings {
+        if settings.sync_enabled && !settings.sync_url.trim().is_empty() {
+            let client = HttpSyncClient::new();
+            let target = date.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(err) = client.delete_records(&settings, vec![target]).await {
+                    eprintln!("[sync] 删除同步失败: {err}");
+                }
+            });
+        }
+    }
     Ok(())
 }
 
@@ -525,6 +550,26 @@ async fn check_update(app: AppHandle) -> Result<UpdateInfo, String> {
             url: None,
         }),
     }
+}
+
+/// 一键下载并安装更新：Windows 安装器会自行退出应用，macOS/Linux 安装后自动重启。
+/// 前端只需在调用前提示「下载中」，不必再引导用户去浏览器手动下载。
+#[tauri::command]
+async fn install_update(app: AppHandle) -> Result<String, String> {
+    let updater = app.updater().map_err(|err| err.to_string())?;
+    let Some(update) = updater.check().await.map_err(|err| err.to_string())? else {
+        return Err("已是最新版本，无需安装".into());
+    };
+    let version = update.version.clone();
+    update
+        .download_and_install(|_chunk, _total| {}, || {})
+        .await
+        .map_err(|err| err.to_string())?;
+    // Windows 分支在启动安装器后由插件结束进程，这里不会继续执行；
+    // macOS / Linux 需要重启才会真正用上新版本。
+    #[cfg(not(windows))]
+    app.restart();
+    Ok(format!("已安装 {version}"))
 }
 
 /// 跨平台系统通知（Windows / macOS / Linux 均可用，依赖 tauri-plugin-notification）。
@@ -1357,7 +1402,8 @@ fn main() {
             restore_db,
             export_json,
             import_json,
-            check_update
+            check_update,
+            install_update
         ])
         .build(tauri::generate_context!())
         .expect("failed to build app")

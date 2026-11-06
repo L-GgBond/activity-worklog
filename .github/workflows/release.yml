@@ -17,7 +17,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [macos-latest]
+        # Windows 用户占多数：只发 macOS 包时，Windows 端检查更新会拿不到对应平台的更新包。
+        platform: [macos-latest, windows-latest]
     runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout
@@ -54,7 +55,7 @@ jobs:
         with:
           tagName: v__VERSION__
           releaseName: "Activity Worklog v__VERSION__"
-          releaseBody: "自动构建的 macOS 安装包与更新资源。"
+          releaseBody: "自动构建的安装包与更新资源（macOS / Windows）。"
           # 必须发布态（非草稿）：updater 端点 /releases/latest/download 只解析已发布的 Release，
           # 草稿态会 404 导致更新检测失败。签名需先配置 TAURI_SIGNING_PRIVATE_KEY。
           releaseDraft: false

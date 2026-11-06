@@ -39,6 +39,15 @@ pub struct AppSettings {
     // 菜单栏驻留模式：隐藏 Dock 图标，仅菜单栏常驻
     #[serde(default)]
     pub menubar_only: bool,
+    // 每周工作日（0=周日 … 6=周六），默认周一至周五
+    #[serde(default = "default_workdays")]
+    pub workdays: Vec<u8>,
+    // 法定节假日（YYYY-MM-DD）：即使是工作日也不计入达成率
+    #[serde(default)]
+    pub holidays: Vec<String>,
+    // 调休补班日（YYYY-MM-DD）：即使是周末也按工作日统计
+    #[serde(default)]
+    pub makeup_days: Vec<String>,
     // 应用锁：argon2id PHC 字符串，空表示未启用
     #[serde(default)]
     pub password_hash: String,
@@ -75,6 +84,10 @@ fn default_sync_interval() -> u32 {
     15
 }
 
+fn default_workdays() -> Vec<u8> {
+    vec![1, 2, 3, 4, 5]
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -95,6 +108,9 @@ impl Default for AppSettings {
             daily_target_minutes: default_daily_target(),
             retention_days: 0,
             menubar_only: true,
+            workdays: default_workdays(),
+            holidays: Vec::new(),
+            makeup_days: Vec::new(),
             password_hash: String::new(),
             recovery_hash: String::new(),
         }

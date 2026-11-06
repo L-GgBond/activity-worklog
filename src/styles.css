@@ -2996,3 +2996,167 @@ button.primary.sm {
   line-height: 1.5;
   word-break: break-all;
 }
+/* 设置页：工作日选择 + 节假日 / 调休补班日期列表 */
+.weekPicker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 4px 20px 10px;
+}
+
+.weekChip {
+  min-width: 52px;
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  color: var(--text-dim);
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.16s ease, color 0.16s ease, border-color 0.16s ease;
+}
+
+.weekChip:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.weekChip.active {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--on-accent);
+  box-shadow: var(--shadow-xs);
+}
+
+.weekChip.active:hover {
+  border-color: var(--accent-strong);
+  background: var(--accent-strong);
+  color: var(--on-accent);
+}
+
+.scheduleGrid > .fieldHint,
+.weekPicker + .fieldHint {
+  padding: 0 20px 12px;
+  margin: 0;
+  color: var(--text-faint);
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+
+.dateListInput {
+  width: 100%;
+  min-height: 86px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.6;
+  resize: vertical;
+}
+
+.dateListInput:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: var(--ring);
+}
+
+.holidayGrid {
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  padding-top: 4px;
+}
+
+/* 数据分析：最近三个月日历热图 */
+.calHeatWrap {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 18px;
+  padding: 4px 2px 2px;
+}
+
+.calMonth h4 {
+  margin: 0 0 8px;
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.calHead,
+.calGrid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 4px;
+}
+
+.calHead {
+  margin-bottom: 4px;
+}
+
+.calHead span {
+  color: var(--text-faint);
+  font-size: 10.5px;
+  text-align: center;
+}
+
+.calCell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  aspect-ratio: 1 / 1;
+  border-radius: var(--r-xs);
+  background: var(--surface-3);
+  color: var(--text-faint);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  cursor: default;
+  transition: transform 0.14s ease;
+}
+
+.calCell:hover {
+  transform: scale(1.08);
+}
+
+.calCell.off {
+  outline: 1px dashed var(--border-strong);
+  outline-offset: -1px;
+}
+
+.calL1 { background: rgba(47, 138, 108, 0.2); color: var(--text-dim); }
+.calL2 { background: rgba(47, 138, 108, 0.42); color: var(--on-accent); }
+.calL3 { background: rgba(47, 138, 108, 0.68); color: var(--on-accent); }
+.calL4 { background: var(--work); color: var(--on-accent); }
+
+.calBlank {
+  aspect-ratio: 1 / 1;
+}
+
+.calLegend {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 14px;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.calLegend i {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  background: var(--surface-3);
+}
+
+.calLegend i.calL1 { background: rgba(47, 138, 108, 0.2); }
+.calLegend i.calL2 { background: rgba(47, 138, 108, 0.42); }
+.calLegend i.calL3 { background: rgba(47, 138, 108, 0.68); }
+.calLegend i.calL4 { background: var(--work); }
+
+.calLegend em {
+  margin-left: 8px;
+  font-style: normal;
+  color: var(--text-faint);
+}
