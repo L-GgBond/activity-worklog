@@ -590,6 +590,46 @@ async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<String, 
     Ok(format!("已同步 {} 天记录", accepted.len()))
 }
 
+/// 从服务器拉取历史日汇总，只补本地缺失的日期（换机 / 重装 / 误删后恢复）。
+#[tauri::command]
+async fn pull_from_server(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    days: u32,
+) -> Result<String, String> {
+    ensure_unlocked(&state)?;
+    let settings = {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| "store lock failed".to_string())?;
+        store.get_settings().map_err(|err| err.to_string())?
+    };
+    if !settings.sync_enabled {
+        return Err("请先启用同步".into());
+    }
+    if settings.sync_url.trim().is_empty() {
+        return Err("请先填写服务器地址".into());
+    }
+
+    let client = HttpSyncClient::new();
+    let records = client
+        .pull_records(&settings, days)
+        .await
+        .map_err(|err| err.to_string())?;
+    let inserted = {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| "store lock failed".to_string())?;
+        store
+            .import_missing_records(&records)
+            .map_err(|err| err.to_string())?
+    };
+    let _ = app.emit("records-updated", ());
+    Ok(format!("已从服务器补回 {inserted} 天记录（仅缺失日期）"))
+}
+
 /// 把用户输入的恢复码归一化：忽略大小写、横线与空格，统一成 4 位一组
 fn normalize_code(raw: &str) -> String {
     let cleaned: String = raw
@@ -789,6 +829,51 @@ fn toggle_pause(state: State<AppState>) -> Result<bool, String> {
             .map_err(|err| err.to_string())?;
     }
     Ok(now_paused)
+}
+
+/// 当前数据库文件的绝对路径：设置页直接展示，用户自己备份/迁移时不用再猜位置。
+#[tauri::command]
+fn db_path(state: State<'_, AppState>) -> Result<String, String> {
+    ensure_unlocked(&state)?;
+    let store = state
+        .store
+        .lock()
+        .map_err(|_| "store lock failed".to_string())?;
+    Ok(store.db_path().to_string_lossy().to_string())
+}
+
+/// 在系统文件管理器中打开数据目录（Windows 资源管理器 / macOS Finder / Linux 文件管理器）。
+#[tauri::command]
+fn open_data_dir(state: State<'_, AppState>) -> Result<String, String> {
+    ensure_unlocked(&state)?;
+    let dir = {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| "store lock failed".to_string())?;
+        store
+            .db_path()
+            .parent()
+            .map(|path| path.to_path_buf())
+            .ok_or_else(|| "无法定位数据目录".to_string())?
+    };
+
+    #[cfg(target_os = "windows")]
+    let opened = {
+        use std::os::windows::process::CommandExt;
+        std::process::Command::new("explorer")
+            .arg(&dir)
+            // CREATE_NO_WINDOW：避免每次打开目录闪一个黑色控制台窗口
+            .creation_flags(0x0800_0000)
+            .spawn()
+    };
+    #[cfg(target_os = "macos")]
+    let opened = std::process::Command::new("open").arg(&dir).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let opened = std::process::Command::new("xdg-open").arg(&dir).spawn();
+
+    opened.map_err(|err| format!("打开数据目录失败：{err}"))?;
+    Ok(dir.to_string_lossy().to_string())
 }
 
 /// 将前端生成的周报字节写入「下载 / Activity Worklog」目录，返回完整路径。
@@ -1261,9 +1346,12 @@ fn main() {
             export_records_csv,
             test_sync_connection,
             sync_now,
+            pull_from_server,
             is_paused,
             toggle_pause,
             export_report,
+            db_path,
+            open_data_dir,
             hourly_activity,
             export_db,
             restore_db,

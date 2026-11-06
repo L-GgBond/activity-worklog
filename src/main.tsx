@@ -7,11 +7,13 @@ import { getVersion } from "@tauri-apps/api/app";
 import {
   Activity,
   BarChart3,
+  CalendarPlus,
   ChevronRight,
   Clock3,
   Database,
   Download,
   FileJson,
+  FolderOpen,
   Moon,
   Pause,
   Play,
@@ -227,6 +229,126 @@ function shortTime(time: string) {
   return time.slice(0, 5);
 }
 
+/** 本地日期键 YYYY-MM-DD（用于「今天」判断，不能用 toISOString 否则会按 UTC 少一天） */
+function localDateKey(day: Date) {
+  return dateKey(day);
+}
+
+/**
+ * 时段重叠校验：手工编辑/补录时最容易出现的错误。
+ * 两段一旦重叠，segment_stats 会把同一段时间重复累计，日活跃时长直接虚高。
+ */
+function segmentOverlapError(list: Segment[]): string | null {
+  const sorted = [...list].sort(
+    (a, b) => timeToSeconds(a.started_at) - timeToSeconds(b.started_at)
+  );
+  for (let i = 0; i < sorted.length; i += 1) {
+    if (timeToSeconds(sorted[i].ended_at) < timeToSeconds(sorted[i].started_at)) {
+      return "开始时间不能晚于结束时间";
+    }
+    if (i > 0 && timeToSeconds(sorted[i].started_at) < timeToSeconds(sorted[i - 1].ended_at)) {
+      return `时段重叠：${shortTime(sorted[i - 1].started_at)}–${shortTime(
+        sorted[i - 1].ended_at
+      )} 与 ${shortTime(sorted[i].started_at)}–${shortTime(sorted[i].ended_at)}`;
+    }
+  }
+  return null;
+}
+
+const WEEKDAY_NAMES = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+
+function csvCell(value: string | number) {
+  const text = String(value ?? "");
+  // 逗号、引号、换行都要按 CSV 规范包裹并转义；中文内容本身不需要引号
+  return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+/**
+ * 月度考勤 CSV：给用户自己核对或交给 HR 的表格。
+ * 与「导出全部记录」不同，这里按自然月出表，并直接算出迟到 / 早退 / 加班分钟数，
+ * 免去在 Excel 里再写一遍公式。周末行会标注，便于区分调休与加班。
+ */
+function buildAttendanceCsv(records: DailyRecord[], month: string, settings: Settings) {
+  const ws = parseHM(settings.work_start);
+  const we = parseHM(settings.work_end);
+  const lines: string[] = [
+    [
+      "日期",
+      "星期",
+      "上班时间",
+      "下班时间",
+      "活跃时长(小时)",
+      "活跃(分钟)",
+      "迟到(分钟)",
+      "早退(分钟)",
+      "加班(分钟)",
+      "备注"
+    ].join(",")
+  ];
+  const sorted = [...records].sort((a, b) => a.date.localeCompare(b.date));
+  let totalActive = 0;
+  let totalLate = 0;
+  let totalEarly = 0;
+  let totalOvertime = 0;
+  for (const record of sorted) {
+    const weekday = new Date(`${record.date}T00:00:00`).getDay();
+    const isWeekend = weekday === 0 || weekday === 6;
+    const hasRecord = record.active_minutes + record.idle_minutes > 0;
+    const startSec = record.first_activity_at ? parseHM(record.first_activity_at) : null;
+    const endSec = record.last_activity_at ? parseHM(record.last_activity_at) : null;
+    // 周末不计算迟到/早退（不是应到岗日），但加班照常统计
+    const late =
+      !isWeekend && startSec !== null ? Math.max(0, Math.round((startSec - ws) / 60)) : 0;
+    const early =
+      !isWeekend && endSec !== null ? Math.max(0, Math.round((we - endSec) / 60)) : 0;
+    const overtime = endSec !== null ? Math.max(0, Math.round((endSec - we) / 60)) : 0;
+    const notes: string[] = [];
+    if (!hasRecord) notes.push("无活动记录");
+    if (isWeekend) notes.push("周末");
+    if (late >= 30) notes.push("迟到");
+    if (early >= 30) notes.push("早退");
+    if (overtime >= 30) notes.push("加班");
+    totalActive += record.active_minutes;
+    totalLate += late;
+    totalEarly += early;
+    totalOvertime += overtime;
+    lines.push(
+      [
+        record.date,
+        WEEKDAY_NAMES[weekday],
+        record.first_activity_at ? shortTime(record.first_activity_at) : "",
+        record.last_activity_at ? shortTime(record.last_activity_at) : "",
+        (record.active_minutes / 60).toFixed(2),
+        record.active_minutes,
+        late,
+        early,
+        overtime,
+        notes.join("；")
+      ]
+        .map(csvCell)
+        .join(",")
+    );
+  }
+  lines.push("");
+  lines.push(
+    [
+      `合计（${month}）`,
+      `${sorted.length} 天`,
+      "",
+      "",
+      (totalActive / 60).toFixed(2),
+      totalActive,
+      totalLate,
+      totalEarly,
+      totalOvertime,
+      ""
+    ]
+      .map(csvCell)
+      .join(",")
+  );
+  return lines.join("\r\n");
+}
+
 function App() {
   const [records, setRecords] = useState<DailyRecord[]>([]);
   const [segments, setSegments] = useState<Segment[]>([]);
@@ -252,6 +374,8 @@ function App() {
   const [paused, setPaused] = useState(false);
   const [syncInfo, setSyncInfo] = useState<SyncSummary | null>(null);
   const [manualSyncing, setManualSyncing] = useState(false);
+  const [pulling, setPulling] = useState(false);
+  const [confirmPull, setConfirmPull] = useState(false);
   const [auth, setAuth] = useState<AuthState | null>(null);
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   const [monthFilter, setMonthFilter] = useState("");
@@ -262,6 +386,12 @@ function App() {
   const [editMode, setEditMode] = useState(false);
   const [editSegments, setEditSegments] = useState<Segment[]>([]);
   const [firstRunTip, setFirstRunTip] = useState(false);
+  // 补录：给没有记录的一天（忘开机、换机、休假补卡）手工添加时段
+  const [backfillOpen, setBackfillOpen] = useState(false);
+  const [backfillDate, setBackfillDate] = useState("");
+  const [backfillSegments, setBackfillSegments] = useState<Segment[]>([]);
+  const [now, setNow] = useState(() => new Date());
+  const [dataPath, setDataPath] = useState("");
 
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
@@ -301,13 +431,43 @@ function App() {
   const todayStr = today?.date ?? "";
 
   const syncState = syncTestResult
-    ? /^(连接成功|已同步|没有待同步)/.test(syncTestResult)
+    ? /^(连接成功|已同步|没有待同步|已从服务器补回|再次点击)/.test(syncTestResult)
       ? "ok"
       : "err"
     : "";
 
   // 采集失败时（macOS 未授权输入监控最常见），今日面板不再假装“正常”
   const captureProblem = status.startsWith("无法读取");
+
+  // 当前在岗状态：用「最后一次活动距今多久」与离开阈值比较，给出一句人话结论
+  const todayIsToday = Boolean(today && today.date === localDateKey(now));
+  const idleSeconds =
+    today?.last_activity_at && todayIsToday
+      ? Math.max(
+          0,
+          now.getHours() * 3600 +
+            now.getMinutes() * 60 +
+            now.getSeconds() -
+            timeToSeconds(today.last_activity_at)
+        )
+      : null;
+  const idleThresholdSeconds = settings.idle_threshold_minutes * 60;
+  const liveState = paused
+    ? "记录已暂停"
+    : !todayIsToday
+    ? "今日还没有活动"
+    : idleSeconds === null
+    ? "等待首次活动"
+    : idleSeconds < idleThresholdSeconds
+    ? "工作中"
+    : `已离开 ${Math.max(1, Math.round(idleSeconds / 60))} 分钟`;
+  const liveTone = paused
+    ? "paused"
+    : idleSeconds === null || !todayIsToday
+    ? "idle"
+    : idleSeconds < idleThresholdSeconds
+    ? "work"
+    : "away";
 
   // 历史记录加载窗口：默认 366 天，可「加载更早」
   const [recordLimit, setRecordLimit] = useState(366);
@@ -543,6 +703,20 @@ function App() {
       .catch(() => setAppVersion("0.2.0"));
   }, []);
 
+  // 顶栏「当前在岗状态」：每 30 秒走一次，避免只看 15 秒采样刷新时分钟数不更新
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(new Date()), 30000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  // 数据目录路径：只在设置页读取一次，用于让用户找得到备份文件
+  useEffect(() => {
+    if (page !== "settings" || !inTauri) return;
+    invoke<string>("db_path")
+      .then(setDataPath)
+      .catch(() => {});
+  }, [page]);
+
   // 托盘「今日小结」：显示并聚焦窗口到记录页，顶部展示今日小结
   useEffect(() => {
     let unlisten: (() => void) | null = null;
@@ -620,11 +794,10 @@ function App() {
 
   async function saveEdit(date: string) {
     const list = editSegments.filter((seg) => seg.date === date);
-    for (const seg of list) {
-      if (seg.started_at.slice(0, 5) > seg.ended_at.slice(0, 5)) {
-        pushLog("保存失败：存在开始时间晚于结束时间的时段");
-        return;
-      }
+    const error = segmentOverlapError(list);
+    if (error) {
+      pushLog(`保存失败：${error}`);
+      return;
     }
     try {
       await invoke("save_segments", { date, segments: list });
@@ -701,6 +874,31 @@ function App() {
       pushLog(`立即同步失败：${err}`);
     } finally {
       setManualSyncing(false);
+    }
+  }
+
+  /**
+   * 从服务器补回历史（换机 / 重装 / 误删后的恢复路径）。
+   * 后端只插入本地缺失的日期，不会覆盖本地已有记录；两步点击避免误触。
+   */
+  async function pullFromServer() {
+    if (!confirmPull) {
+      setConfirmPull(true);
+      setSyncTestResult("再次点击「从服务器恢复」确认：只补本地缺失的日期，不会覆盖已有记录");
+      return;
+    }
+    setConfirmPull(false);
+    setPulling(true);
+    try {
+      const msg = await invoke<string>("pull_from_server", { days: 365 });
+      setSyncTestResult(msg);
+      pushLog(msg);
+      await refresh();
+    } catch (err) {
+      setSyncTestResult(String(err));
+      pushLog(`从服务器恢复失败：${err}`);
+    } finally {
+      setPulling(false);
     }
   }
 
@@ -906,6 +1104,116 @@ function App() {
     }
   }
 
+  /** 月度考勤 CSV：按当前筛选月份（未选则取最近一个月）出表，含迟到/早退/加班分钟 */
+  async function exportAttendance() {
+    const month =
+      monthFilter || displayRecords[0]?.date.slice(0, 7) || dateKey(new Date()).slice(0, 7);
+    const rows = displayRecords.filter((record) => record.date.startsWith(month));
+    if (rows.length === 0) {
+      setStatus(`${month} 没有可导出的记录`);
+      return;
+    }
+    try {
+      const csv = buildAttendanceCsv(rows, month, settingsRef.current);
+      // Excel 对 UTF-8 的识别依赖 BOM，中文表头不加 BOM 会变乱码
+      const bytes = new Uint8Array([0xef, 0xbb, 0xbf, ...new TextEncoder().encode(csv)]);
+      const path = await invoke<string>("export_report", {
+        filename: `Activity Worklog 考勤 ${month}`,
+        data: Array.from(bytes),
+        ext: "csv"
+      });
+      pushLog(`已导出 ${month} 考勤：${path}`);
+      setStatus(`考勤已导出：${path}`);
+    } catch (err) {
+      pushLog(`导出考勤失败：${err}`);
+      setStatus(isPreview ? "预览模式：桌面端可导出考勤" : `导出考勤失败：${err}`);
+    }
+  }
+
+  function openBackfill() {
+    // 默认落到最近一个「没有记录的工作日」：新用户最常见的场景是忘开机、换机，
+    // 直接给今天反而会被「已有记录」挡住，白点一次。
+    const existing = new Set(displayRecords.map((record) => record.date));
+    let initial = "";
+    for (let offset = 1; offset <= 30; offset += 1) {
+      const day = new Date(now.getFullYear(), now.getMonth(), now.getDate() - offset);
+      const key = dateKey(day);
+      const weekend = day.getDay() === 0 || day.getDay() === 6;
+      if (!existing.has(key) && !weekend) {
+        initial = key;
+        break;
+      }
+    }
+    if (!initial) initial = monthFilter ? `${monthFilter}-01` : dateKey(now);
+    setBackfillOpen(true);
+    setBackfillDate(initial);
+    setBackfillSegments([
+      { date: initial, started_at: "09:30:00", ended_at: "12:00:00", segment_type: "work" }
+    ]);
+    setExpandedDate(null);
+    setEditMode(false);
+  }
+
+  function closeBackfill() {
+    setBackfillOpen(false);
+    setBackfillSegments([]);
+  }
+
+  function changeBackfillDate(next: string) {
+    setBackfillDate(next);
+    setBackfillSegments((prev) => prev.map((seg) => ({ ...seg, date: next })));
+  }
+
+  async function saveBackfill() {
+    if (isPreview) {
+      pushLog("预览模式：补录需要在桌面端运行");
+      return;
+    }
+    if (!backfillDate) {
+      pushLog("请先选择要补录的日期");
+      return;
+    }
+    if (backfillDate > dateKey(new Date())) {
+      pushLog("不能补录未来的日期");
+      return;
+    }
+    const list = backfillSegments.map((seg) => ({ ...seg, date: backfillDate }));
+    if (list.length === 0) {
+      pushLog("请至少添加一个时段");
+      return;
+    }
+    const error = segmentOverlapError(list);
+    if (error) {
+      pushLog(`保存失败：${error}`);
+      return;
+    }
+    try {
+      // 补录只用于「空白日」：已有段落的日期必须走行内编辑，避免整段被覆盖
+      const existing = await invoke<Segment[]>("list_segments", { date: backfillDate });
+      if (existing.length > 0) {
+        pushLog(`${backfillDate} 已有记录，请在历史行内点「编辑时段」修改`);
+        return;
+      }
+      await invoke("save_segments", { date: backfillDate, segments: list });
+      pushLog(`已补录 ${backfillDate}`);
+      closeBackfill();
+      await refresh();
+    } catch (err) {
+      pushLog(`补录失败：${err}`);
+    }
+  }
+
+  async function openDataDir() {
+    try {
+      const path = await invoke<string>("open_data_dir");
+      setDataPath(path);
+      pushLog(`已打开数据目录：${path}`);
+    } catch (err) {
+      pushLog(`打开数据目录失败：${err}`);
+      setStatus(isPreview ? "预览模式：桌面端可打开数据目录" : "打开数据目录失败");
+    }
+  }
+
   async function checkForUpdate() {
     setChecking(true);
     setUpdateInfo(null);
@@ -1087,6 +1395,13 @@ function App() {
                 </button>
               )}
               <button title="刷新" aria-label="刷新" onClick={refresh}><RefreshCcw size={18} /></button>
+              <button
+                title="导出当月考勤 CSV（含迟到/早退/加班）"
+                aria-label="导出当月考勤 CSV"
+                onClick={exportAttendance}
+              >
+                <CalendarPlus size={18} />
+              </button>
               <button title="导出 CSV" aria-label="导出 CSV" onClick={exportCsv}><Download size={18} /></button>
             </div>
           )}
@@ -1113,7 +1428,10 @@ function App() {
                   {captureProblem ? "活动采集异常" : "今日记录正常"}
                 </strong>
               </div>
-              <span>
+              <span className="todayMeta">
+                <span className={`liveState ${liveTone}`} title="按最后一次键鼠活动与离开阈值判断">
+                  {liveState}
+                </span>
                 {`${isPreview ? "演示数据 · " : ""}${new Date(
                   `${today.date}T00:00:00`
                 ).toLocaleDateString("zh-CN", { weekday: "long" })} · 共 ${
@@ -1248,22 +1566,130 @@ function App() {
                     共 {isPreview ? displayRecords.length : totalCount || displayRecords.length} 天，本地保存，可按需同步数据库
                   </p>
                 </div>
-                {months.length > 1 && (
-                  <select
-                    className="monthFilter"
-                    value={monthFilter}
-                    onChange={(event) => setMonthFilter(event.target.value)}
-                    aria-label="按月份筛选"
+                <div className="historyTools">
+                  {months.length > 1 && (
+                    <select
+                      className="monthFilter"
+                      value={monthFilter}
+                      onChange={(event) => setMonthFilter(event.target.value)}
+                      aria-label="按月份筛选"
+                    >
+                      <option value="">全部月份</option>
+                      {months.map((month) => (
+                        <option key={month} value={month}>
+                          {month.replace("-", " 年 ")} 月
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                  <button
+                    className="linkBtn backfillBtn"
+                    onClick={openBackfill}
+                    title="给没有记录的一天手工补录上班/离开时段"
                   >
-                    <option value="">全部月份</option>
-                    {months.map((month) => (
-                      <option key={month} value={month}>
-                        {month.replace("-", " 年 ")} 月
-                      </option>
-                    ))}
-                  </select>
-                )}
+                    <CalendarPlus size={13} /> 补录一天
+                  </button>                </div>
               </div>
+              {backfillOpen && (
+                <div className="backfillPanel">
+                  <div className="backfillHead">
+                    <strong>补录某一天</strong>
+                    <input
+                      type="date"
+                      value={backfillDate}
+                      max={dateKey(new Date())}
+                      onChange={(event) => changeBackfillDate(event.target.value)}
+                      aria-label="补录日期"
+                    />
+                    <button
+                      className="linkBtn"
+                      onClick={() => {
+                        const date = backfillDate || dateKey(new Date());
+                        setBackfillSegments((prev) => [
+                          ...prev,
+                          {
+                            date,
+                            started_at: "13:30:00",
+                            ended_at: "18:00:00",
+                            segment_type: "work"
+                          }
+                        ]);
+                      }}
+                    >
+                      + 添加时段
+                    </button>
+                    <span className="backfillActions">
+                      <button className="primary sm" onClick={saveBackfill}>保存补录</button>
+                      <button className="linkBtn" onClick={closeBackfill}>取消</button>
+                    </span>
+                  </div>
+                  {backfillSegments.length === 0 && (
+                    <span className="rowDetailEmpty">还没有时段，点「添加时段」新增</span>
+                  )}
+                  {backfillSegments.map((seg, index) => {
+                    const invalid =
+                      timeToSeconds(seg.ended_at) < timeToSeconds(seg.started_at);
+                    return (
+                      <div
+                        className={`segmentRow edit ${seg.segment_type} ${invalid ? "invalid" : ""}`}
+                        key={`backfill-${index}`}
+                      >
+                        <select
+                          value={seg.segment_type}
+                          onChange={(e) =>
+                            setBackfillSegments((prev) =>
+                              prev.map((item, i) =>
+                                i === index
+                                  ? { ...item, segment_type: e.target.value as Segment["segment_type"] }
+                                  : item
+                              )
+                            )
+                          }
+                        >
+                          <option value="work">工作</option>
+                          <option value="away">离开</option>
+                        </select>
+                        <input
+                          type="time"
+                          value={seg.started_at.slice(0, 5)}
+                          onChange={(e) =>
+                            setBackfillSegments((prev) =>
+                              prev.map((item, i) =>
+                                i === index ? { ...item, started_at: `${e.target.value}:00` } : item
+                              )
+                            )
+                          }
+                        />
+                        <span className="segDash">–</span>
+                        <input
+                          type="time"
+                          value={seg.ended_at.slice(0, 5)}
+                          onChange={(e) =>
+                            setBackfillSegments((prev) =>
+                              prev.map((item, i) =>
+                                i === index ? { ...item, ended_at: `${e.target.value}:00` } : item
+                              )
+                            )
+                          }
+                        />
+                        {invalid && <span className="segErr">起止无效</span>}
+                        <button
+                          className="iconBtn danger"
+                          aria-label="删除时段"
+                          onClick={() =>
+                            setBackfillSegments((prev) => prev.filter((_, i) => i !== index))
+                          }
+                        >
+                          <Trash2 size={13} />
+                        </button>
+                      </div>
+                    );
+                  })}
+                  <p className="fieldHint">
+                    补录只针对没有记录的日子；已有记录请在对应行点「编辑时段」。保存后会自动重算当天的开始/结束与活跃时长。
+                  </p>
+                </div>
+              )}
               <div className="table">
                 <div className="row head">
                   <span>日期</span>
@@ -1460,6 +1886,7 @@ function App() {
             reportRef={reportRef}
             onExport={handleExport}
             onExportCsv={exportCsv}
+            onExportAttendance={exportAttendance}
             onExportPdf={handleExportPdf}
             exportState={exportState}
             exportPath={exportPath}
@@ -1523,6 +1950,15 @@ function App() {
                 >
                   <RefreshCcw size={15} />
                   {manualSyncing ? "同步中…" : "立即同步"}
+                </button>
+                <button
+                  onClick={pullFromServer}
+                  disabled={pulling || !settings.sync_enabled}
+                  className={confirmPull ? "dangerBtn confirming" : undefined}
+                  title="换电脑或重装后，从服务器补回本地缺失的历史日汇总"
+                >
+                  <Download size={15} />
+                  {pulling ? "恢复中…" : confirmPull ? "确认从服务器恢复" : "从服务器恢复"}
                 </button>
                 {syncTestResult && (
                   <span className={`syncResult ${syncState}`}>{syncTestResult}</span>
@@ -1775,7 +2211,9 @@ function App() {
                 <button onClick={restoreDb}>恢复备份…</button>
                 <button onClick={exportJson}><FileJson size={16} />导出 JSON</button>
                 <button onClick={importJson}>导入 JSON…</button>
-                <button
+                <button onClick={openDataDir} title="在文件管理器中打开数据库所在目录">
+                  <FolderOpen size={16} />打开数据目录
+                </button>                <button
                   className={`dangerBtn${confirmClear ? " confirming" : ""}`}
                   onClick={clearAllRecords}
                 >
@@ -1783,6 +2221,7 @@ function App() {
                   {confirmClear ? "再次点击清除全部" : "清除全部记录"}
                 </button>
               </div>
+              {dataPath && <p className="pathLine">数据库位置：{dataPath}</p>}
               <p className="hint">SQLite 热备适合整库恢复；JSON 导出含日汇总与逐时段明细，纯文本可读可改，更适合跨机迁移与人工校订。导入会以 JSON 内容全量替换当前记录。</p>
               <p className="hint">清除只删除本机的活动记录，设置与同步配置会保留。</p>
               </div>
@@ -2539,6 +2978,7 @@ function AnalyticsPage({
   reportRef,
   onExport,
   onExportCsv,
+  onExportAttendance,
   onExportPdf,
   exportState,
   exportPath,
@@ -2549,6 +2989,7 @@ function AnalyticsPage({
   reportRef: React.RefObject<HTMLDivElement>;
   onExport: () => void;
   onExportCsv: () => void;
+  onExportAttendance: () => void;
   onExportPdf: () => void;
   exportState: "idle" | "exporting" | "done" | "error";
   exportPath: string;
@@ -2698,6 +3139,9 @@ function AnalyticsPage({
           </button>
           <button className="exportBtn" onClick={onExportCsv}>
             <Download size={15} />导出 CSV
+          </button>
+          <button className="exportBtn" onClick={onExportAttendance}>
+            <CalendarPlus size={15} />导出当月考勤
           </button>
           <button className="exportBtn" onClick={onExportPdf} disabled={exportState === "exporting"}>
             <Download size={15} />

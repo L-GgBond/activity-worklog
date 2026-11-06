@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use chrono::{DateTime, Local, Timelike};
+use chrono::{DateTime, Local, NaiveDate, Timelike};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{from_str, to_string_pretty};
@@ -218,6 +218,37 @@ impl Store {
             }
         }
         Ok(changed)
+    }
+
+    /// 从服务器补回本地缺失的日期：只插入不存在的日期，绝不覆盖本地已有记录
+    /// （本地可能已经手工编辑过时段，覆盖会丢掉用户的修改）。
+    /// 补回的记录直接标记为 synced，不会因为“新插入”又被推回服务器。
+    pub fn import_missing_records(&self, records: &[DailyRecord]) -> anyhow::Result<usize> {
+        let updated_at = Local::now().to_rfc3339();
+        let mut inserted = 0usize;
+        for record in records {
+            if NaiveDate::parse_from_str(&record.date, "%Y-%m-%d").is_err() {
+                continue;
+            }
+            let changed = self.conn.execute(
+                "
+                insert into daily_work_records
+                    (date, first_activity_at, last_activity_at, active_minutes, idle_minutes, sync_status, updated_at)
+                values (?1, ?2, ?3, ?4, ?5, 'synced', ?6)
+                on conflict(date) do nothing
+                ",
+                params![
+                    record.date,
+                    record.first_activity_at,
+                    record.last_activity_at,
+                    record.active_minutes,
+                    record.idle_minutes,
+                    &updated_at
+                ],
+            )?;
+            inserted += changed;
+        }
+        Ok(inserted)
     }
 
     /// 写入某天的日统计，返回是否有实际写入：
@@ -653,6 +684,23 @@ impl Store {
             }
             if parse_time_seconds(&seg.started_at) > parse_time_seconds(&seg.ended_at) {
                 anyhow::bail!("开始时间不能晚于结束时间");
+            }
+        }
+        // 相邻时段不得重叠：重叠会让 segment_stats 把同一段时间重复累计，
+        // 手工编辑/补录时最容易犯这个错，必须在落库前拦住。
+        let mut ranges: Vec<(i64, i64)> = segments
+            .iter()
+            .map(|seg| {
+                (
+                    parse_time_seconds(&seg.started_at),
+                    parse_time_seconds(&seg.ended_at),
+                )
+            })
+            .collect();
+        ranges.sort_unstable();
+        for pair in ranges.windows(2) {
+            if pair[1].0 < pair[0].1 {
+                anyhow::bail!("时段之间存在重叠，请调整后再保存");
             }
         }
         self.persist_day_segments(date, segments)?;

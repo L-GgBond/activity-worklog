@@ -7,6 +7,26 @@ pub struct SyncPayload {
     pub records: Vec<DailyRecord>,
 }
 
+/// 服务端返回的日汇总（不含 sync_status，落库时统一标记为 synced）。
+#[derive(Debug, Clone, serde::Deserialize)]
+struct PulledRecord {
+    date: String,
+    #[serde(default)]
+    first_activity_at: Option<String>,
+    #[serde(default)]
+    last_activity_at: Option<String>,
+    #[serde(default)]
+    active_minutes: i64,
+    #[serde(default)]
+    idle_minutes: i64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PullResponse {
+    #[serde(default)]
+    records: Vec<PulledRecord>,
+}
+
 /// 基于 reqwest 的同步客户端，负责把待同步记录推送到 Web 后台。
 pub struct HttpSyncClient {
     client: reqwest::Client,
@@ -72,6 +92,46 @@ impl HttpSyncClient {
             Some(accepted) => Ok(accepted),
             None => Ok(sent),
         }
+    }
+
+    /// 从服务器拉取近 days 天的日汇总：换机、重装、误删本地数据后用来补回历史。
+    pub async fn pull_records(
+        &self,
+        settings: &AppSettings,
+        days: u32,
+    ) -> anyhow::Result<Vec<DailyRecord>> {
+        let url = normalize_url(&settings.sync_url);
+        if url.is_empty() {
+            anyhow::bail!("未配置同步服务器地址");
+        }
+        let days = days.clamp(1, 3660);
+        let endpoint = format!("{url}/api/sync/records?days={days}");
+
+        let mut request = self.client.get(&endpoint);
+        if !settings.sync_token.is_empty() {
+            request = request.bearer_auth(&settings.sync_token);
+        }
+
+        let response = request.send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("拉取失败，服务器返回 {status}: {body}");
+        }
+
+        let body: PullResponse = response.json().await?;
+        Ok(body
+            .records
+            .into_iter()
+            .map(|record| DailyRecord {
+                date: record.date,
+                first_activity_at: record.first_activity_at,
+                last_activity_at: record.last_activity_at,
+                active_minutes: record.active_minutes,
+                idle_minutes: record.idle_minutes,
+                sync_status: "synced".to_string(),
+            })
+            .collect())
     }
 
     /// 测试连接：GET /api/health，校验 Token 与服务可达性。

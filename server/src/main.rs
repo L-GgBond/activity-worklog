@@ -121,6 +121,32 @@ fn authorize(headers: &HeaderMap, token: &str) -> Result<(), StatusCode> {
     }
 }
 
+/// 拉取服务器上的日汇总：换机/重装客户端后可以直接补回历史（只返回日汇总，不含时段明细）。
+async fn pull_records(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<RangeQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    authorize(&headers, &state.token)?;
+    let days = query.days.unwrap_or(365).clamp(1, 3660);
+    let since = date_n_days_ago(days - 1);
+    let conn = state.conn.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rows = query_rows(&conn, &format!("date >= '{since}'"))?;
+    let records = rows
+        .into_iter()
+        .map(|(date, first, last, active, idle)| {
+            serde_json::json!({
+                "date": date,
+                "first_activity_at": first,
+                "last_activity_at": last,
+                "active_minutes": active,
+                "idle_minutes": idle,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(serde_json::json!({ "records": records })))
+}
+
 async fn health(State(state): State<AppState>, headers: HeaderMap) -> Result<String, StatusCode> {
     authorize(&headers, &state.token)?;
     Ok("ok".to_string())
@@ -396,7 +422,7 @@ async fn main() {
     let app = Router::new()
         .route("/", get(dashboard))
         .route("/api/health", get(health))
-        .route("/api/sync/records", post(sync_records))
+        .route("/api/sync/records", post(sync_records).get(pull_records))
         .route("/api/reports/daily", get(daily_report))
         .route("/api/reports/weekly", get(weekly_report))
         .route("/api/reports/monthly", get(monthly_report))
