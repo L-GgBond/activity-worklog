@@ -97,6 +97,10 @@ type Settings = {
   quiet_end: string;
   /** 周报机器人 webhook，空表示不推送 */
   report_webhook: string;
+  /** 应用/窗口识别总开关：默认关闭、纯本地、不参与同步 */
+  window_tracking_enabled: boolean;
+  /** 是否记录窗口标题，关闭则只记应用名 */
+  window_track_title: boolean;
 };
 
 type Page = "records" | "analytics" | "sync" | "settings";
@@ -142,7 +146,9 @@ const defaultSettings: Settings = {
   notify_pause: true,
   quiet_start: "22:00",
   quiet_end: "08:00",
-  report_webhook: ""
+  report_webhook: "",
+  window_tracking_enabled: false,
+  window_track_title: true
 };
 
 /** 是否运行在 Tauri 桌面容器内（纯浏览器打开时为 false，用于界面预览） */
@@ -714,6 +720,15 @@ function App() {
       await refresh();
     } catch (err) {
       pushLog(`备份恢复失败：${err}`);
+    }
+  }
+
+  async function clearAppUsageHistory() {
+    try {
+      const msg = await invoke<string>("clear_app_usage");
+      pushLog(msg);
+    } catch (err) {
+      pushLog(`清空应用使用记录失败：${err}`);
     }
   }
   const [editMode, setEditMode] = useState(false);
@@ -2943,6 +2958,43 @@ function App() {
                 <li>默认只保存活动时间、统计分钟数与同步状态</li>
                 <li>数据保存在本机，只有开启同步后才上传服务器</li>
               </ul>
+              <div className="windowTrackBlock">
+                <h3 className="blockTitle">可选：应用与窗口识别（默认关闭）</h3>
+                <p className="fieldHint">
+                  开启后记录你正在使用的前台应用与窗口标题，用于回答「时间花在哪个软件上」。
+                  数据只保存在本机，<strong>不会同步、不会上传</strong>，可随时关闭。
+                </p>
+                <label className="switchRow">
+                  <input
+                    type="checkbox"
+                    checked={settings.window_tracking_enabled}
+                    onChange={(event) =>
+                      updateSettings({ window_tracking_enabled: event.target.checked })
+                    }
+                  />
+                  <span>启用应用与窗口识别</span>
+                </label>
+                <label className="switchRow switchRowSub">
+                  <input
+                    type="checkbox"
+                    checked={settings.window_track_title}
+                    disabled={!settings.window_tracking_enabled}
+                    onChange={(event) =>
+                      updateSettings({ window_track_title: event.target.checked })
+                    }
+                  />
+                  <span>记录窗口标题（关闭后只保留应用名，进一步减少敏感信息）</span>
+                </label>
+                <div className="inlineTestRow">
+                  <button
+                    type="button"
+                    className="dangerBtn panelBtn"
+                    onClick={clearAppUsageHistory}
+                  >
+                    <Trash2 size={14} />清空应用使用记录
+                  </button>
+                </div>
+              </div>
             </section>
             <section
               id="sec-about"
@@ -4310,12 +4362,174 @@ function AnalyticsPage({
           <HourHeatmap hours={hours} />
         </div>
       </section>
+
+      <AppUsagePanel enabled={settings.window_tracking_enabled} />
       </div>
     </div>
   );
 }
 
-/** 一周各天平均活跃柱状图（周末用暖色区分） */
+type AppUsageStatRow = {
+  app_name: string;
+  total_seconds: number;
+  bucket_count: number;
+  last_date: string;
+};
+
+type AppUsageBucketRow = {
+  date: string;
+  started_at: string;
+  ended_at: string;
+  app_name: string;
+  window_title: string;
+};
+
+/** 秒数转「X 小时 Y 分」 */
+function formatDurationSec(sec: number) {
+  const h = Math.floor(sec / 3600);
+  const m = Math.round((sec % 3600) / 60);
+  if (h <= 0) return `${m} 分钟`;
+  return m > 0 ? `${h} 小时 ${m} 分` : `${h} 小时`;
+}
+
+/** 应用与窗口使用分析：应用时长排行 + 单日窗口明细。仅在功能开启时有数据。 */
+function AppUsagePanel({ enabled }: { enabled: boolean }) {
+  const [range, setRange] = useState(7);
+  const [stats, setStats] = useState<AppUsageStatRow[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [detailDate, setDetailDate] = useState(dateKey(new Date()));
+  const [detail, setDetail] = useState<AppUsageBucketRow[]>([]);
+
+  useEffect(() => {
+    if (!enabled) return;
+    let cancelled = false;
+    setLoading(true);
+    invoke<AppUsageStatRow[]>("app_usage_summary", { rangeDays: range })
+      .then((rows) => {
+        if (!cancelled) setStats(rows);
+      })
+      .catch(() => {
+        if (!cancelled) setStats([]);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [enabled, range]);
+
+  useEffect(() => {
+    if (!enabled) return;
+    invoke<AppUsageBucketRow[]>("app_usage_detail", { date: detailDate })
+      .then(setDetail)
+      .catch(() => setDetail([]));
+  }, [enabled, detailDate]);
+
+  if (!enabled) {
+    return (
+      <section className="panel">
+        <div className="panelTitle">
+          <div>
+            <h2>应用使用情况</h2>
+            <p>看看时间花在了哪些软件上</p>
+          </div>
+        </div>
+        <Empty
+          icon={<Timer size={26} />}
+          title="应用与窗口识别未开启"
+          description="在「设置 → 隐私说明」里开启后，这里会按应用统计使用时长；数据只保存在本机，不会同步。"
+        />
+      </section>
+    );
+  }
+
+  const total = stats.reduce((sum, row) => sum + row.total_seconds, 0);
+  const maxSec = Math.max(...stats.map((row) => row.total_seconds), 1);
+
+  return (
+    <section className="panel">
+      <div className="panelTitle">
+        <div>
+          <h2>应用使用情况</h2>
+          <p>近 {range} 天各前台应用累计时长（仅本机，不同步）</p>
+        </div>
+        <div className="tabs" role="group" aria-label="应用统计区间">
+          {[7, 30].map((value) => (
+            <button
+              key={value}
+              className={range === value ? "tab active" : "tab"}
+              onClick={() => setRange(value)}
+            >
+              近 {value} 天
+            </button>
+          ))}
+        </div>
+      </div>
+      {loading ? (
+        <Skeleton lines={4} />
+      ) : stats.length === 0 ? (
+        <Empty
+          icon={<Timer size={26} />}
+          title="暂无应用使用数据"
+          description="开启后保持应用在后台运行，稍后再回来查看。"
+        />
+      ) : (
+        <>
+          <div className="appUsageList">
+            {stats.map((row) => {
+              const barPct = Math.round((row.total_seconds / maxSec) * 100);
+              const share = total > 0 ? Math.round((row.total_seconds / total) * 100) : 0;
+              return (
+                <div className="appUsageRow" key={row.app_name}>
+                  <div className="appUsageHead">
+                    <span className="appUsageName">{row.app_name || "(未知应用)"}</span>
+                    <span className="appUsageTime">
+                      {formatDurationSec(row.total_seconds)} · {share}%
+                    </span>
+                  </div>
+                  <div className="appUsageBar">
+                    <i style={{ width: `${barPct}%` }} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <div className="appUsageDetail">
+            <div className="appUsageDetailHead">
+              <h3>单日窗口明细</h3>
+              <input
+                type="date"
+                value={detailDate}
+                max={dateKey(new Date())}
+                onChange={(event) => setDetailDate(event.target.value)}
+              />
+            </div>
+            {detail.length === 0 ? (
+              <p className="fieldHint">当天没有窗口记录。</p>
+            ) : (
+              <div className="appWindowList">
+                {detail.map((bucket, index) => (
+                  <div className="appWindowRow" key={`${bucket.started_at}-${index}`}>
+                    <span className="appWindowTime">
+                      {bucket.started_at}–{bucket.ended_at}
+                    </span>
+                    <span className="appWindowApp">{bucket.app_name}</span>
+                    <span className="appWindowTitle">
+                      {bucket.window_title || "（无标题）"}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
+
 function WeekdayChart({ records }: { records: DailyRecord[] }) {
   const names = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
   const buckets: number[][] = Array.from({ length: 7 }, () => []);

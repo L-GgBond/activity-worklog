@@ -81,6 +81,12 @@ pub struct AppSettings {
     // 周报推送地址（企业微信/飞书/钉钉机器人 webhook），空表示不推送
     #[serde(default)]
     pub report_webhook: String,
+    // 应用/窗口识别总开关：默认关闭，开启后仅在本机记录前台应用与窗口，不参与同步
+    #[serde(default)]
+    pub window_tracking_enabled: bool,
+    // 是否记录窗口标题：关闭后只保留应用名，进一步降低敏感信息落盘
+    #[serde(default = "default_true")]
+    pub window_track_title: bool,
 }
 
 fn default_work_start() -> String {
@@ -162,6 +168,8 @@ impl Default for AppSettings {
             quiet_start: default_quiet_start(),
             quiet_end: default_quiet_end(),
             report_webhook: String::new(),
+            window_tracking_enabled: false,
+            window_track_title: true,
         }
     }
 }

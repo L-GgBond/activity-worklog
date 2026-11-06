@@ -32,6 +32,26 @@ pub struct ActivitySegment {
     pub segment_type: String,
 }
 
+/// 前台应用/窗口使用桶：一个应用的一个窗口从获得到失去焦点的连续区间。
+/// 仅在用户开启「应用与窗口识别」后产生，纯本地存储，不参与同步。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppUsageBucket {
+    pub date: String,
+    pub started_at: String,
+    pub ended_at: String,
+    pub app_name: String,
+    pub window_title: String,
+}
+
+/// 应用使用汇总：按应用聚合的累计秒数，用于排行榜。
+#[derive(Debug, Clone, Serialize)]
+pub struct AppUsageStat {
+    pub app_name: String,
+    pub total_seconds: i64,
+    pub bucket_count: i64,
+    pub last_date: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SyncSummary {
     pub pending: i64,
@@ -112,6 +132,19 @@ impl Store {
             );
 
             create index if not exists idx_activity_segments_date on activity_segments(date);
+
+            create table if not exists app_usage (
+                id integer primary key autoincrement,
+                date text not null,
+                started_at text not null,
+                ended_at text not null,
+                app_name text not null,
+                window_title text not null default ''
+            );
+
+            create index if not exists idx_app_usage_date on app_usage(date);
+            create unique index if not exists idx_app_usage_key
+                on app_usage(date, started_at, app_name);
             ",
         )?;
         Ok(())
@@ -757,11 +790,93 @@ impl Store {
     pub fn purge_old_records(&self, cutoff: &str) -> anyhow::Result<i64> {
         self.conn
             .execute("delete from activity_segments where date < ?1", params![cutoff])?;
+        self.conn
+            .execute("delete from app_usage where date < ?1", params![cutoff])?;
         let removed = self.conn.execute(
             "delete from daily_work_records where date < ?1",
             params![cutoff],
         )?;
         Ok(removed as i64)
+    }
+
+    /// 写入或延长一个应用使用桶。自然键 (date, started_at, app_name) 唯一，
+    /// 同一窗口持续获焦时只更新 ended_at，崩溃时最多丢失最后一个采样周期的数据。
+    pub fn upsert_app_usage(&mut self, bucket: &AppUsageBucket) -> anyhow::Result<()> {
+        self.conn.execute(
+            "insert into app_usage (date, started_at, ended_at, app_name, window_title)
+             values (?1, ?2, ?3, ?4, ?5)
+             on conflict(date, started_at, app_name) do update set
+                ended_at = excluded.ended_at,
+                window_title = excluded.window_title",
+            params![
+                bucket.date,
+                bucket.started_at,
+                bucket.ended_at,
+                bucket.app_name,
+                bucket.window_title
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 最近 days 天（含今天）按应用聚合的使用时长排行榜。
+    pub fn app_usage_summary(&self, days: u32) -> anyhow::Result<Vec<AppUsageStat>> {
+        let cutoff = (Local::now().date_naive() - chrono::Duration::days(days as i64 - 1))
+            .format("%Y-%m-%d")
+            .to_string();
+        let mut stmt = self.conn.prepare(
+            "select app_name,
+                    sum(max(0, strftime('%s','2000-01-01 '||ended_at)
+                               - strftime('%s','2000-01-01 '||started_at))) as total_seconds,
+                    count(1) as bucket_count,
+                    max(date) as last_date
+             from app_usage
+             where date >= ?1
+             group by app_name
+             order by total_seconds desc",
+        )?;
+        let rows = stmt.query_map(params![cutoff], |row| {
+            Ok(AppUsageStat {
+                app_name: row.get(0)?,
+                total_seconds: row.get(1)?,
+                bucket_count: row.get(2)?,
+                last_date: row.get(3)?,
+            })
+        })?;
+        let mut list = Vec::new();
+        for row in rows {
+            list.push(row?);
+        }
+        Ok(list)
+    }
+
+    /// 某一天的全部应用使用明细（含窗口标题），按开始时间排序。
+    pub fn app_usage_for_date(&self, date: &str) -> anyhow::Result<Vec<AppUsageBucket>> {
+        let mut stmt = self.conn.prepare(
+            "select date, started_at, ended_at, app_name, window_title
+             from app_usage
+             where date = ?1
+             order by started_at, id",
+        )?;
+        let rows = stmt.query_map(params![date], |row| {
+            Ok(AppUsageBucket {
+                date: row.get(0)?,
+                started_at: row.get(1)?,
+                ended_at: row.get(2)?,
+                app_name: row.get(3)?,
+                window_title: row.get(4)?,
+            })
+        })?;
+        let mut list = Vec::new();
+        for row in rows {
+            list.push(row?);
+        }
+        Ok(list)
+    }
+
+    /// 清空全部应用使用记录（不影响日汇总与时段）。
+    pub fn clear_app_usage(&self) -> anyhow::Result<usize> {
+        Ok(self.conn.execute("delete from app_usage", [])?)
     }
 
     /// 同步概况：待同步天数 / 已同步天数 / 上次同步时间（落库时间）。

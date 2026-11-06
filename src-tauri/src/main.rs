@@ -11,7 +11,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use activity::InputActivityProbe;
 use chrono::{NaiveDate, Datelike, Local, TimeZone, Timelike};
-use db::{segment_stats, ActivitySegment, DailyRecord, HourBucket, Store, SyncSummary};
+use db::{
+    segment_stats, ActivitySegment, AppUsageBucket, AppUsageStat, DailyRecord, HourBucket, Store,
+    SyncSummary,
+};
 use settings::AppSettings;
 use sync::HttpSyncClient;
 use tauri::menu::{Menu, MenuItem, MenuItemKind};
@@ -421,6 +424,52 @@ fn hourly_activity(state: State<AppState>, range_days: u32) -> Result<Vec<HourBu
         .map_err(|_| "store lock failed".to_string())?
         .hourly_activity(range_days)
         .map_err(|err| err.to_string())
+}
+
+/// 应用使用排行榜（最近 range_days 天，按应用聚合秒数）。
+#[tauri::command]
+fn app_usage_summary(
+    state: State<AppState>,
+    range_days: u32,
+) -> Result<Vec<AppUsageStat>, String> {
+    ensure_unlocked(&state)?;
+    let days = range_days.clamp(1, 365);
+    state
+        .store
+        .lock()
+        .map_err(|_| "store lock failed".to_string())?
+        .app_usage_summary(days)
+        .map_err(|err| err.to_string())
+}
+
+/// 某一天的应用使用明细（含窗口标题）。
+#[tauri::command]
+fn app_usage_detail(
+    state: State<AppState>,
+    date: String,
+) -> Result<Vec<AppUsageBucket>, String> {
+    ensure_unlocked(&state)?;
+    state
+        .store
+        .lock()
+        .map_err(|_| "store lock failed".to_string())?
+        .app_usage_for_date(&date)
+        .map_err(|err| err.to_string())
+}
+
+/// 清空全部应用使用记录（不影响日汇总、时段与设置）。
+#[tauri::command]
+fn clear_app_usage(app: AppHandle, state: State<AppState>) -> Result<String, String> {
+    ensure_unlocked(&state)?;
+    let removed = state
+        .store
+        .lock()
+        .map_err(|_| "store lock failed".to_string())?
+        .clear_app_usage()
+        .map_err(|err| err.to_string())?;
+    logging::write("INFO", &format!("清空应用使用记录 {removed} 条"));
+    let _ = app.emit("app-usage-cleared", ());
+    Ok(format!("已清空 {removed} 条应用使用记录"))
 }
 
 #[derive(serde::Serialize)]
@@ -1298,6 +1347,8 @@ fn spawn_activity_loop(app: AppHandle) {
         let mut probe_failures: u32 = 0;
         // 暂停提醒做节流，避免每 15 秒弹一次
         let mut last_pause_notify: Option<Instant> = None;
+        // 应用/窗口识别当前进行中的桶；仅在设置开启时维护
+        let mut win_bucket: Option<AppUsageBucket> = None;
 
         loop {
             tokio::time::sleep(Duration::from_secs(15)).await;
@@ -1307,6 +1358,8 @@ fn spawn_activity_loop(app: AppHandle) {
 
             if state.paused.load(Ordering::Relaxed) {
                 was_paused = true;
+                // 暂停期间不采集窗口，上一个桶已按最后采样时间落库，直接丢弃内存引用
+                win_bucket = None;
                 // 暂停超过 30 分钟提醒一次，之后每 30 分钟再提醒，防止用户忙忘整天没记录
                 let pause_settings = state
                     .store
@@ -1427,6 +1480,7 @@ fn spawn_activity_loop(app: AppHandle) {
 
             // 超过 12 小时无任何输入视为机器关闭/休眠，不计入离开时长
             if idle_for > Duration::from_secs(12 * 3600) {
+                win_bucket = None;
                 continue;
             }
 
@@ -1462,6 +1516,47 @@ fn spawn_activity_loop(app: AppHandle) {
             // 只有当天统计真的变化时才通知前端刷新
             if day_changed {
                 let _ = app.emit("records-updated", ());
+            }
+
+            // 应用/窗口识别：默认关闭，开启后仅写本地 app_usage 表，不进入任何同步载荷
+            if settings.window_tracking_enabled {
+                if let Some(info) = probe.foreground_window() {
+                    let title = if settings.window_track_title {
+                        info.title
+                    } else {
+                        String::new()
+                    };
+                    let bucket_date = now.format("%Y-%m-%d").to_string();
+                    let clock = now.format("%H:%M:%S").to_string();
+                    let same = win_bucket.as_ref().map(|b| {
+                        b.date == bucket_date
+                            && b.app_name == info.app_name
+                            && b.window_title == title
+                    });
+                    if same == Some(true) {
+                        if let Some(bucket) = win_bucket.as_mut() {
+                            bucket.ended_at = clock;
+                            if let Ok(mut store) = state.store.lock() {
+                                let _ = store.upsert_app_usage(bucket);
+                            }
+                        }
+                    } else {
+                        let bucket = AppUsageBucket {
+                            date: bucket_date,
+                            started_at: clock.clone(),
+                            ended_at: clock,
+                            app_name: info.app_name,
+                            window_title: title,
+                        };
+                        if let Ok(mut store) = state.store.lock() {
+                            let _ = store.upsert_app_usage(&bucket);
+                        }
+                        win_bucket = Some(bucket);
+                    }
+                }
+            } else if win_bucket.is_some() {
+                // 功能被关闭：最后一个桶已带着结束时间写好，丢弃内存引用
+                win_bucket = None;
             }
 
             // 托盘 tooltip 直接用内存段落计算今日活跃占比，不再每个采样周期查一遍库
@@ -1843,7 +1938,10 @@ fn main() {
             list_backups,
             restore_named_backup,
             notify_test,
-            test_webhook
+            test_webhook,
+            app_usage_summary,
+            app_usage_detail,
+            clear_app_usage
         ])
         .build(tauri::generate_context!())
         .expect("failed to build app")
