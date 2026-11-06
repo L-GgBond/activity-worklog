@@ -1141,7 +1141,7 @@ function App() {
   useEffect(() => {
     getVersion()
       .then(setAppVersion)
-      .catch(() => setAppVersion("0.3.0"));
+      .catch(() => setAppVersion("0.4.0"));
   }, []);
 
   // 顶栏「当前在岗状态」：每 30 秒走一次，避免只看 15 秒采样刷新时分钟数不更新
