@@ -54,6 +54,26 @@ pub struct AppSettings {
     // 恢复码的哈希（同样 argon2id），用于忘记密码时重设
     #[serde(default)]
     pub recovery_hash: String,
+    // 暂停状态持久化：重启后仍保持用户上次的暂停/记录选择
+    #[serde(default)]
+    pub paused: bool,
+    // 通知偏好：长时间离开提醒
+    #[serde(default = "default_true")]
+    pub notify_away: bool,
+    // 通知偏好：跨天时的日终小结
+    #[serde(default = "default_true")]
+    pub notify_daily_summary: bool,
+    // 通知偏好：暂停太久的提醒
+    #[serde(default = "default_true")]
+    pub notify_pause: bool,
+    // 免打扰时段（HH:MM），处于该区间内不弹通知
+    #[serde(default = "default_quiet_start")]
+    pub quiet_start: String,
+    #[serde(default = "default_quiet_end")]
+    pub quiet_end: String,
+    // 周报推送地址（企业微信/飞书/钉钉机器人 webhook），空表示不推送
+    #[serde(default)]
+    pub report_webhook: String,
 }
 
 fn default_work_start() -> String {
@@ -88,6 +108,18 @@ fn default_workdays() -> Vec<u8> {
     vec![1, 2, 3, 4, 5]
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_quiet_start() -> String {
+    "22:00".into()
+}
+
+fn default_quiet_end() -> String {
+    "08:00".into()
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -113,6 +145,13 @@ impl Default for AppSettings {
             makeup_days: Vec::new(),
             password_hash: String::new(),
             recovery_hash: String::new(),
+            paused: false,
+            notify_away: true,
+            notify_daily_summary: true,
+            notify_pause: true,
+            quiet_start: default_quiet_start(),
+            quiet_end: default_quiet_end(),
+            report_webhook: String::new(),
         }
     }
 }

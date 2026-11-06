@@ -1,15 +1,16 @@
 mod activity;
 mod db;
+mod logging;
 mod settings;
 mod sync;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use activity::InputActivityProbe;
-use chrono::{Local, TimeZone};
+use chrono::{NaiveDate, Datelike, Local, TimeZone, Timelike};
 use db::{segment_stats, ActivitySegment, DailyRecord, HourBucket, Store, SyncSummary};
 use settings::AppSettings;
 use sync::HttpSyncClient;
@@ -29,6 +30,8 @@ use argon2::Argon2;
 struct AppState {
     store: Mutex<Store>,
     paused: AtomicBool,
+    /// 会议/专注模式截止时间（unix 秒）：在此之前强制按“工作”计算，0 表示未开启
+    focus_until: AtomicI64,
     /// 采集缓冲重置标记：1 = 清空重来（删除/清空记录后），2 = 以数据库为准重新加载（恢复备份后）
     resetting: AtomicU8,
     /// 应用锁：未解锁时所有读数据的命令都会被拒绝
@@ -314,6 +317,18 @@ fn save_settings(
         }
         let _ = app.emit("records-updated", ());
     }
+
+    // 设置同步到服务端：让服务端报表与客户端使用同一套作息/工作日历口径。
+    // 失败只记日志，不阻断本地保存。
+    if next.sync_enabled && !next.sync_url.trim().is_empty() {
+        let client = HttpSyncClient::new();
+        let snapshot = next.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(err) = client.push_settings(&snapshot).await {
+                logging::write("WARN", &format!("设置同步失败: {err}"));
+            }
+        });
+    }
     Ok(())
 }
 
@@ -352,6 +367,7 @@ async fn delete_day(
             tauri::async_runtime::spawn(async move {
                 if let Err(err) = client.delete_records(&settings, vec![target]).await {
                     eprintln!("[sync] 删除同步失败: {err}");
+                    logging::write("WARN", &format!("删除同步失败: {err}"));
                 }
             });
         }
@@ -405,6 +421,32 @@ fn hourly_activity(state: State<AppState>, range_days: u32) -> Result<Vec<HourBu
         .map_err(|_| "store lock failed".to_string())?
         .hourly_activity(range_days)
         .map_err(|err| err.to_string())
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackupFile {
+    name: String,
+    size: u64,
+    modified: String,
+}
+
+#[tauri::command]
+fn list_backups(state: State<AppState>) -> Result<Vec<BackupFile>, String> {
+    ensure_unlocked(&state)?;
+    let store = state
+        .store
+        .lock()
+        .map_err(|_| "store lock failed".to_string())?;
+    Ok(store
+        .list_backups()
+        .into_iter()
+        .map(|(name, size, modified)| BackupFile {
+            name,
+            size,
+            modified,
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -521,6 +563,8 @@ struct UpdateInfo {
     latest: Option<String>,
     notes: Option<String>,
     url: Option<String>,
+    // 失败分类：network / endpoint / signature / other，前端据此给可操作的提示
+    error_kind: Option<String>,
 }
 
 #[tauri::command]
@@ -534,6 +578,7 @@ async fn check_update(app: AppHandle) -> Result<UpdateInfo, String> {
             latest: Some(update.version.to_string()),
             notes: update.body,
             url: Some(update.download_url.to_string()),
+            error_kind: None,
         }),
         Ok(None) => Ok(UpdateInfo {
             status: "latest".into(),
@@ -541,14 +586,38 @@ async fn check_update(app: AppHandle) -> Result<UpdateInfo, String> {
             latest: Some(current),
             notes: None,
             url: None,
+            error_kind: None,
         }),
-        Err(err) => Ok(UpdateInfo {
-            status: "error".into(),
-            current,
-            latest: None,
-            notes: Some(err.to_string()),
-            url: None,
-        }),
+        Err(err) => {
+            let raw = err.to_string();
+            let lower = raw.to_lowercase();
+            let kind = if lower.contains("signature") || lower.contains("verify") {
+                "signature"
+            } else if lower.contains("404")
+                || lower.contains("not found")
+                || lower.contains("release")
+                || lower.contains("target")
+            {
+                "endpoint"
+            } else if lower.contains("dns")
+                || lower.contains("connect")
+                || lower.contains("timed out")
+                || lower.contains("network")
+                || lower.contains("resolve")
+            {
+                "network"
+            } else {
+                "other"
+            };
+            Ok(UpdateInfo {
+                status: "error".into(),
+                current,
+                latest: None,
+                notes: Some(raw),
+                url: None,
+                error_kind: Some(kind.into()),
+            })
+        }
     }
 }
 
@@ -581,6 +650,48 @@ fn notify(app: &AppHandle, message: &str) {
         .title("Activity Worklog")
         .body(message)
         .show();
+}
+
+/// 带偏好的通知：自动跳过免打扰时段；enabled=false 时直接不发。
+fn notify_if_allowed(app: &AppHandle, settings: &AppSettings, enabled: bool, message: &str) {
+    if !enabled || in_quiet_hours(settings) {
+        return;
+    }
+    notify(app, message);
+}
+
+/// 当前是否处于免打扰时段。支持跨零点（如 22:00–08:00）。
+fn in_quiet_hours(settings: &AppSettings) -> bool {
+    let now_minutes = {
+        let now = Local::now();
+        now.hour() * 60 + now.minute()
+    };
+    let start = parse_hm_minutes(&settings.quiet_start);
+    let end = parse_hm_minutes(&settings.quiet_end);
+    match (start, end) {
+        (Some(start), Some(end)) => {
+            if start == end {
+                false
+            } else if start < end {
+                now_minutes >= start && now_minutes < end
+            } else {
+                // 跨零点：开始之后或结束之前
+                now_minutes >= start || now_minutes < end
+            }
+        }
+        _ => false,
+    }
+}
+
+/// "HH:MM" → 当天分钟数，非法格式返回 None。
+fn parse_hm_minutes(value: &str) -> Option<u32> {
+    let mut parts = value.split(':');
+    let hour: u32 = parts.next()?.trim().parse().ok()?;
+    let minute: u32 = parts.next()?.trim().parse().ok()?;
+    if hour > 23 || minute > 59 {
+        return None;
+    }
+    Some(hour * 60 + minute)
 }
 
 /// 立即把待同步记录推一次，不等定时器。
@@ -889,8 +1000,42 @@ fn toggle_pause(state: State<AppState>) -> Result<bool, String> {
         store
             .close_open_segments(&mut segments, Local::now())
             .map_err(|err| err.to_string())?;
+        // 暂停状态持久化：重启后仍保持，避免用户以为没在记录
+        let mut persisted = store.get_settings().map_err(|err| err.to_string())?;
+        persisted.paused = true;
+        store
+            .save_settings(&persisted)
+            .map_err(|err| err.to_string())?;
+    } else {
+        // 恢复记录：清掉持久化标记
+        if let Ok(store) = state.store.lock() {
+            if let Ok(mut persisted) = store.get_settings() {
+                persisted.paused = false;
+                let _ = store.save_settings(&persisted);
+            }
+        }
     }
     Ok(now_paused)
+}
+
+/// 开启会议/专注模式：minutes 分钟内即使没有键鼠输入也按“工作”计算。
+/// minutes 传 0 表示提前关闭。返回截止时间的 unix 秒（0 表示已关闭）。
+#[tauri::command]
+fn set_focus_mode(state: State<AppState>, minutes: u32) -> Result<i64, String> {
+    ensure_unlocked(&state)?;
+    let deadline = if minutes == 0 {
+        0
+    } else {
+        now_unix() + i64::from(minutes) * 60
+    };
+    state.focus_until.store(deadline, Ordering::Relaxed);
+    Ok(deadline)
+}
+
+/// 读取会议/专注模式截止时间（unix 秒），0 表示未开启。
+#[tauri::command]
+fn focus_deadline(state: State<AppState>) -> i64 {
+    state.focus_until.load(Ordering::Relaxed)
 }
 
 /// 当前数据库文件的绝对路径：设置页直接展示，用户自己备份/迁移时不用再猜位置。
@@ -1080,6 +1225,8 @@ fn spawn_activity_loop(app: AppHandle) {
 
         let mut away_notified = false;
         let mut probe_failures: u32 = 0;
+        // 暂停提醒做节流，避免每 15 秒弹一次
+        let mut last_pause_notify: Option<Instant> = None;
 
         loop {
             tokio::time::sleep(Duration::from_secs(15)).await;
@@ -1089,8 +1236,28 @@ fn spawn_activity_loop(app: AppHandle) {
 
             if state.paused.load(Ordering::Relaxed) {
                 was_paused = true;
+                // 暂停超过 30 分钟提醒一次，之后每 30 分钟再提醒，防止用户忙忘整天没记录
+                let pause_settings = state
+                    .store
+                    .lock()
+                    .ok()
+                    .and_then(|store| store.get_settings().ok())
+                    .unwrap_or_default();
+                let due = last_pause_notify
+                    .map(|instant| instant.elapsed() >= Duration::from_secs(30 * 60))
+                    .unwrap_or(true);
+                if due {
+                    last_pause_notify = Some(Instant::now());
+                    notify_if_allowed(
+                        &app,
+                        &pause_settings,
+                        pause_settings.notify_pause,
+                        "记录仍处于暂停状态，别忘了恢复记录",
+                    );
+                }
                 continue;
             }
+            last_pause_notify = None;
 
             // 从暂停恢复：重新从数据库加载段落，避免把暂停期间算成工作时长
             if was_paused {
@@ -1109,11 +1276,36 @@ fn spawn_activity_loop(app: AppHandle) {
                     .and_hms_opt(23, 59, 59)
                     .and_then(|naive| Local.from_local_datetime(&naive).single())
                     .unwrap_or(now);
+                let ended_key = current_date.format("%Y-%m-%d").to_string();
                 if let Ok(mut store) = state.store.lock() {
                     let _ = store.close_open_segments(&mut segments, close_ts);
                 }
+                // 日终小结：用刚收口的段落统计昨天的活跃时长
+                let day_stats = segment_stats(&segments, &ended_key);
+                let summary_settings = state
+                    .store
+                    .lock()
+                    .ok()
+                    .and_then(|store| store.get_settings().ok())
+                    .unwrap_or_default();
+                let target = summary_settings.daily_target_minutes;
+                let verdict = if target > 0 && day_stats.active_minutes >= target {
+                    "已达标"
+                } else {
+                    "未达目标"
+                };
+                notify_if_allowed(
+                    &app,
+                    &summary_settings,
+                    summary_settings.notify_daily_summary,
+                    &format!(
+                        "昨日活跃 {}（{} 分钟，{}）",
+                        ended_key, day_stats.active_minutes, verdict
+                    ),
+                );
                 segments.clear();
                 current_date = now.date_naive();
+                away_notified = false;
             }
 
             let settings = state
@@ -1156,6 +1348,7 @@ fn spawn_activity_loop(app: AppHandle) {
                     // 连续失败才提示，避免偶发抖动打扰
                     if probe_failures == 3 {
                         let _ = app.emit("capture-error", err.to_string());
+                        logging::write("ERROR", &format!("活动采集连续失败: {err}"));
                     }
                     continue;
                 }
@@ -1167,20 +1360,27 @@ fn spawn_activity_loop(app: AppHandle) {
             }
 
             let threshold = Duration::from_secs(u64::from(settings.idle_threshold_minutes.max(1)) * 60);
-            let in_work_session = idle_for <= threshold;
+            // 会议/专注模式：截止时间之前强制算工作，开会无键鼠输入也不会被记成离开
+            let focus_active = state.focus_until.load(Ordering::Relaxed) > now_unix();
+            let in_work_session = focus_active || idle_for <= threshold;
 
-            // 长时间离开提醒：累计离开达 30 分钟时弹一次系统通知
-            if idle_for >= Duration::from_secs(30 * 60) {
+            // 长时间离开提醒：累计离开达 30 分钟时弹一次系统通知（可在设置里关闭、受免打扰约束）
+            if idle_for >= Duration::from_secs(30 * 60) && !focus_active {
                 if !away_notified {
                     away_notified = true;
-                    notify(&app, "已离开约 30 分钟，记得起来活动一下");
+                    notify_if_allowed(
+                        &app,
+                        &settings,
+                        settings.notify_away,
+                        "已离开约 30 分钟，记得起来活动一下",
+                    );
                 }
             } else {
                 away_notified = false;
             }
 
-            // 新段落起点回溯到最后一次真实输入时刻（now - idle_for）
-            let backdate = Some(idle_for);
+            // 专注模式下段落起点不应回溯到“最后输入时刻”，否则会把开会前的空档也算进来
+            let backdate = if focus_active { None } else { Some(idle_for) };
 
             let day_changed = match state.store.lock() {
                 Ok(mut store) => store
@@ -1293,6 +1493,7 @@ fn spawn_sync_loop(app: AppHandle) {
                     // 失败退避：1 分钟后重试，不等满一个同步周期
                     next_sync_at = Some(std::time::Instant::now() + Duration::from_secs(60));
                     let _ = app.emit("sync-error", err.to_string());
+                    logging::write("WARN", &format!("自动同步失败: {err}"));
                 }
             }
         }
@@ -1316,10 +1517,111 @@ fn spawn_backup_loop(app: AppHandle) {
                     Ok(path) => {
                         last_backup_day = Some(today);
                         eprintln!("[backup] 自动备份已写入 {}", path.display());
+                        logging::write("INFO", &format!("自动备份已写入 {}", path.display()));
                     }
-                    Err(err) => eprintln!("[backup] 自动备份失败: {err}"),
+                    Err(err) => {
+                        eprintln!("[backup] 自动备份失败: {err}");
+                        logging::write("ERROR", &format!("自动备份失败: {err}"));
+                    }
                 },
-                Err(err) => eprintln!("[backup] store lock failed: {err}"),
+                Err(err) => {
+                    eprintln!("[backup] store lock failed: {err}");
+                    logging::write("ERROR", &format!("备份时 store lock failed: {err}"));
+                }
+            }
+        }
+    });
+}
+
+/// 周报推送：每周一上午 9 点后把最近 7 天的工时小结发到配置的机器人 webhook。
+/// 兼容企业微信/飞书/钉钉的文本机器人（同时携带三种字段，多余字段会被忽略）。
+fn spawn_report_loop(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+        {
+            Ok(client) => client,
+            Err(_) => return,
+        };
+        let mut last_report_day: Option<chrono::NaiveDate> = None;
+        loop {
+            tokio::time::sleep(Duration::from_secs(60 * 60)).await;
+            let now = Local::now();
+            let today = now.date_naive();
+            if last_report_day == Some(today) || now.weekday().num_days_from_monday() != 0 || now.hour() < 9 {
+                continue;
+            }
+            let (webhook, rows, target) = {
+                let state = app.state::<AppState>();
+                let store = match state.store.lock() {
+                    Ok(store) => store,
+                    Err(_) => continue,
+                };
+                let settings = store.get_settings().unwrap_or_default();
+                if settings.report_webhook.trim().is_empty() {
+                    // 没配置也标记当天，避免每小时重复查库
+                    last_report_day = Some(today);
+                    continue;
+                }
+                let rows = store.list_all_daily_records().unwrap_or_default();
+                (
+                    settings.report_webhook.trim().to_string(),
+                    rows,
+                    settings.daily_target_minutes,
+                )
+            };
+
+            let start = today - chrono::Duration::days(7);
+            let week: Vec<&DailyRecord> = rows
+                .iter()
+                .filter(|row| {
+                    NaiveDate::parse_from_str(&row.date, "%Y-%m-%d")
+                        .map(|day| day >= start && day < today)
+                        .unwrap_or(false)
+                })
+                .collect();
+            if week.is_empty() {
+                last_report_day = Some(today);
+                continue;
+            }
+            let total: i64 = week.iter().map(|row| row.active_minutes).sum();
+            let avg = total / week.len() as i64;
+            let hit = week
+                .iter()
+                .filter(|row| target > 0 && row.active_minutes >= i64::from(target))
+                .count();
+            let mut text = format!(
+                "工时周报（{} 至 {}）\n总活跃 {} 分钟（{} 小时），日均 {} 分钟，达标 {} 天\n",
+                start.format("%m-%d"),
+                today.format("%m-%d"),
+                total,
+                total / 60,
+                avg,
+                hit
+            );
+            for row in &week {
+                text.push_str(&format!("{}: {} 分钟\n", row.date, row.active_minutes));
+            }
+            let payload = serde_json::json!({
+                "msgtype": "text",
+                "msg_type": "text",
+                "text": {"content": text},
+                "content": {"text": text},
+            });
+            match client.post(&webhook).json(&payload).send().await {
+                Ok(response) if response.status().is_success() => {
+                    last_report_day = Some(today);
+                    logging::write("INFO", "周报已推送到 webhook");
+                }
+                Ok(response) => {
+                    logging::write("WARN", &format!("周报推送返回 {}", response.status()));
+                    last_report_day = Some(today);
+                }
+                Err(err) => {
+                    // 网络失败不标记，下个整点重试
+                    logging::write("WARN", &format!("周报推送失败: {err}"));
+                }
             }
         }
     });
@@ -1395,7 +1697,8 @@ fn main() {
             };
             app.manage(AppState {
                 store: Mutex::new(store),
-                paused: AtomicBool::new(false),
+                paused: AtomicBool::new(settings0.paused),
+                focus_until: AtomicI64::new(0),
                 resetting: AtomicU8::new(0),
                 unlocked: AtomicBool::new(!locked),
                 failed_unlocks: AtomicU32::new(throttled.failed_attempts),
@@ -1409,6 +1712,7 @@ fn main() {
             spawn_activity_loop(app.handle().clone());
             spawn_sync_loop(app.handle().clone());
             spawn_backup_loop(app.handle().clone());
+            spawn_report_loop(app.handle().clone());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -1462,7 +1766,10 @@ fn main() {
             export_json,
             import_json,
             check_update,
-            install_update
+            install_update,
+            set_focus_mode,
+            focus_deadline,
+            list_backups
         ])
         .build(tauri::generate_context!())
         .expect("failed to build app")

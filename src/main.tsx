@@ -21,7 +21,8 @@ import {
   Trash2,
   RefreshCcw,
   SlidersHorizontal,
-  Target
+  Target,
+  Timer
 } from "lucide-react";
 import "./styles.css";
 
@@ -70,6 +71,19 @@ type Settings = {
   holidays: string[];
   /** 调休补班日 YYYY-MM-DD，按工作日统计 */
   makeup_days: string[];
+  /** 暂停状态持久化（与后端 settings.paused 对应） */
+  paused: boolean;
+  /** 通知偏好：长时间离开提醒 */
+  notify_away: boolean;
+  /** 通知偏好：日终小结 */
+  notify_daily_summary: boolean;
+  /** 通知偏好：暂停太久提醒 */
+  notify_pause: boolean;
+  /** 免打扰时段 HH:MM */
+  quiet_start: string;
+  quiet_end: string;
+  /** 周报机器人 webhook，空表示不推送 */
+  report_webhook: string;
 };
 
 type Page = "records" | "analytics" | "sync" | "settings";
@@ -105,7 +119,14 @@ const defaultSettings: Settings = {
   menubar_only: false,
   workdays: [1, 2, 3, 4, 5],
   holidays: [],
-  makeup_days: []
+  makeup_days: [],
+  paused: false,
+  notify_away: true,
+  notify_daily_summary: true,
+  notify_pause: true,
+  quiet_start: "22:00",
+  quiet_end: "08:00",
+  report_webhook: ""
 };
 
 /** 是否运行在 Tauri 桌面容器内（纯浏览器打开时为 false，用于界面预览） */
@@ -456,6 +477,7 @@ function App() {
     latest: string | null;
     notes: string | null;
     url: string | null;
+    errorKind?: string | null;
   } | null>(null);
   const [checking, setChecking] = useState(false);
   const [installing, setInstalling] = useState(false);
@@ -481,12 +503,25 @@ function App() {
   const [backfillSegments, setBackfillSegments] = useState<Segment[]>([]);
   const [now, setNow] = useState(() => new Date());
   const [dataPath, setDataPath] = useState("");
+  // 会议/专注模式截止时间（unix 秒），0 表示未开启
+  const [focusDeadline, setFocusDeadline] = useState(0);
+  // 自动备份文件清单（数据健康面板用）
+  const [backupFiles, setBackupFiles] = useState<
+    { name: string; size: number; modified: string }[]
+  >([]);
+  const [focusMenuOpen, setFocusMenuOpen] = useState(false);
+  // 从热图跳转后高亮的日期
+  const [highlightDate, setHighlightDate] = useState<string | null>(null);
 
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
 
   const pausedRef = useRef(paused);
   pausedRef.current = paused;
+
+  // 快捷键通过 ref 调用，避免监听器闭包捕获旧状态
+  const toggleRecordingRef = useRef<() => void>(() => {});
+  const openBackfillRef = useRef<() => void>(() => {});
 
   const authRef = useRef(auth);
   authRef.current = auth;
@@ -516,6 +551,7 @@ function App() {
   const visibleRecords = monthFilter
     ? displayRecords.filter((record) => record.date.startsWith(monthFilter))
     : displayRecords;
+
   const today = displayRecords[0] ?? null;
   const todayStr = today?.date ?? "";
 
@@ -527,6 +563,54 @@ function App() {
 
   // 采集失败时（macOS 未授权输入监控最常见），今日面板不再假装“正常”
   const captureProblem = status.startsWith("无法读取");
+
+  // 会议模式是否仍在生效（now 每秒 tick，剩余时间会自动刷新）
+  const focusActive = focusDeadline > Math.floor(Date.now() / 1000);
+  const focusRemainMin = focusActive
+    ? Math.max(1, Math.round((focusDeadline - Math.floor(Date.now() / 1000)) / 60))
+    : 0;
+
+  // 数据健康：主动汇总异常工作日、采集状态、备份与待同步情况，用户不用自己翻数据
+  const healthItems = useMemo(() => {
+    const items: { level: "ok" | "warn" | "err"; text: string }[] = [];
+    const recent = displayRecords.slice(0, 30);
+    const zeroWorkdays = recent
+      .filter((record) => isWorkdayKey(record.date, settings) && record.active_minutes === 0)
+      .map((record) => record.date);
+    if (zeroWorkdays.length > 0) {
+      items.push({
+        level: "warn",
+        text: `最近 30 天有 ${zeroWorkdays.length} 个工作日零活跃：${zeroWorkdays.slice(0, 3).join("、")}${
+          zeroWorkdays.length > 3 ? " 等" : ""
+        }`,
+      });
+    }
+    const longDays = recent.filter((record) => record.active_minutes > 720);
+    if (longDays.length > 0) {
+      items.push({
+        level: "warn",
+        text: `有 ${longDays.length} 天活跃超过 12 小时，建议核对是否为误判`,
+      });
+    }
+    if (captureProblem) {
+      items.push({ level: "err", text: "活动采集异常，今日数据可能不完整" });
+    }
+    if (backupFiles.length === 0) {
+      items.push({ level: "warn", text: "暂无自动备份，检查数据目录写权限" });
+    } else {
+      items.push({
+        level: "ok",
+        text: `已有 ${backupFiles.length} 份自动备份，最近一份：${backupFiles[0].modified}`,
+      });
+    }
+    if (syncInfo && syncInfo.pending > 0) {
+      items.push({ level: "warn", text: `${syncInfo.pending} 天记录待同步` });
+    }
+    if (items.length === 0) {
+      items.push({ level: "ok", text: "数据状态正常，未发现异常" });
+    }
+    return items;
+  }, [displayRecords, settings, captureProblem, backupFiles, syncInfo]);
 
   // 当前在岗状态：用「最后一次活动距今多久」与离开阈值比较，给出一句人话结论
   const todayIsToday = Boolean(today && today.date === localDateKey(now));
@@ -566,17 +650,24 @@ function App() {
 
   const refresh = useCallback(async () => {
     try {
-      const [loadedRecords, loadedSettings, loadedSync, total] = await Promise.all([
-        invoke<DailyRecord[]>("list_daily_records", { limit: recordLimitRef.current }),
-        invoke<Settings>("get_settings"),
-        invoke<SyncSummary>("sync_summary").catch(() => null),
-        invoke<number>("count_daily_records").catch(() => 0)
-      ]);
+      const [loadedRecords, loadedSettings, loadedSync, total, focus, backups] =
+        await Promise.all([
+          invoke<DailyRecord[]>("list_daily_records", { limit: recordLimitRef.current }),
+          invoke<Settings>("get_settings"),
+          invoke<SyncSummary>("sync_summary").catch(() => null),
+          invoke<number>("count_daily_records").catch(() => 0),
+          invoke<number>("focus_deadline").catch(() => 0),
+          invoke<{ name: string; size: number; modified: string }[]>(
+            "list_backups"
+          ).catch(() => [])
+        ]);
       setRecords(loadedRecords);
       const normalized = normalizeSettings(loadedSettings);
       setSettings(normalized);
       setSyncInfo(loadedSync);
       setTotalCount(Number(total) || loadedRecords.length);
+      setFocusDeadline(Number(focus) || 0);
+      setBackupFiles(backups);
       setIsPreview(false);
       // 状态行只承载“监听/暂停”这类持久状态；操作提示（备份、小结等）不被周期刷新覆盖
       setStatus((prev) =>
@@ -790,7 +881,7 @@ function App() {
   useEffect(() => {
     getVersion()
       .then(setAppVersion)
-      .catch(() => setAppVersion("0.2.0"));
+      .catch(() => setAppVersion("0.3.0"));
   }, []);
 
   // 顶栏「当前在岗状态」：每 30 秒走一次，避免只看 15 秒采样刷新时分钟数不更新
@@ -951,6 +1042,51 @@ function App() {
       setStatus("操作失败，请重试");
     }
   }
+
+  // 会议/专注模式：minutes 分钟内无键鼠输入也按工作计算；0 表示提前关闭
+  async function startFocus(minutes: number) {
+    try {
+      const deadline = await invoke<number>("set_focus_mode", { minutes });
+      setFocusDeadline(deadline);
+      pushLog(minutes === 0 ? "已退出会议模式" : `已开启会议模式（${minutes} 分钟）`);
+    } catch (err) {
+      pushLog(`会议模式操作失败：${err}`);
+    }
+  }
+
+  // 键盘快捷键：Ctrl+Space 暂停/恢复、Ctrl+1..4 切换页面、Ctrl+B 补录
+  useEffect(() => {
+    toggleRecordingRef.current = () => {
+      void toggleRecording();
+    };
+    openBackfillRef.current = () => openBackfill();
+    const pages: Page[] = ["records", "analytics", "sync", "settings"];
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!event.ctrlKey || event.altKey || event.metaKey) return;
+      const target = event.target as HTMLElement | null;
+      const typing =
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.isContentEditable);
+      if (event.code === "Space") {
+        event.preventDefault();
+        toggleRecordingRef.current();
+        return;
+      }
+      if (typing) return;
+      if (event.key >= "1" && event.key <= "4") {
+        event.preventDefault();
+        setPage(pages[Number(event.key) - 1]);
+      } else if (event.key.toLowerCase() === "b") {
+        event.preventDefault();
+        openBackfillRef.current();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function syncNow() {
     setManualSyncing(true);
@@ -1513,6 +1649,46 @@ function App() {
                 <CalendarPlus size={18} />
               </button>
               <button title="导出 CSV" aria-label="导出 CSV" onClick={exportCsv}><Download size={18} /></button>
+              {!isPreview && (
+                <div className="focusMenuWrap">
+                  <button
+                    title="会议模式：期间无键鼠输入也按工作计算"
+                    aria-label="会议模式"
+                    aria-expanded={focusMenuOpen}
+                    className={focusActive ? "focusActiveBtn" : undefined}
+                    onClick={() => setFocusMenuOpen((open) => !open)}
+                  >
+                    <Timer size={18} />
+                  </button>
+                  {focusMenuOpen && (
+                    <div className="focusMenu">
+                      <span className="focusMenuTitle">会议模式持续</span>
+                      {[30, 60, 90].map((minutes) => (
+                        <button
+                          key={minutes}
+                          onClick={() => {
+                            startFocus(minutes);
+                            setFocusMenuOpen(false);
+                          }}
+                        >
+                          {minutes} 分钟
+                        </button>
+                      ))}
+                      {focusActive && (
+                        <button
+                          className="focusMenuCancel"
+                          onClick={() => {
+                            startFocus(0);
+                            setFocusMenuOpen(false);
+                          }}
+                        >
+                          退出会议模式
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           )}
         </header>
@@ -1537,6 +1713,11 @@ function App() {
                 <strong className={captureProblem ? "statusProblem" : undefined}>
                   {captureProblem ? "活动采集异常" : "今日记录正常"}
                 </strong>
+                {focusActive && (
+                  <span className="focusChip" title="会议模式下无键鼠输入也按工作计算">
+                    <Timer size={13} /> 会议模式 · 剩 {focusRemainMin} 分钟
+                  </span>
+                )}
               </div>
               <span className="todayMeta">
                 <span className={`liveState ${liveTone}`} title="按最后一次键鼠活动与离开阈值判断">
@@ -1666,6 +1847,23 @@ function App() {
                   })}
                 </div>
               </div>
+            </section>
+
+            <section className="panel healthPanel">
+              <div className="panelTitle">
+                <div>
+                  <h2>数据健康</h2>
+                  <p>自动检查异常工作日、采集、备份与同步状态</p>
+                </div>
+              </div>
+              <ul className="healthList">
+                {healthItems.map((item, index) => (
+                  <li key={`${item.level}-${index}`} className={`healthItem ${item.level}`}>
+                    <span className="healthDot" />
+                    {item.text}
+                  </li>
+                ))}
+              </ul>
             </section>
 
             <section className="panel">
@@ -1823,7 +2021,9 @@ function App() {
                   return (
                     <Fragment key={record.date}>
                       <div
-                        className={`row rowClickable${empty ? " rowEmpty" : ""}${open ? " rowOpen" : ""}`}
+                        className={`row rowClickable${empty ? " rowEmpty" : ""}${open ? " rowOpen" : ""}${
+                          highlightDate === record.date ? " rowHighlight" : ""
+                        }`}
                         role="button"
                         tabIndex={0}
                         aria-expanded={open}
@@ -2000,6 +2200,12 @@ function App() {
             onExportPdf={handleExportPdf}
             exportState={exportState}
             exportPath={exportPath}
+            onJumpDate={(date) => {
+              setMonthFilter(date.slice(0, 7));
+              setHighlightDate(date);
+              setPage("records");
+              window.setTimeout(() => setHighlightDate(null), 4000);
+            }}
           />
         )}
 
@@ -2213,6 +2419,27 @@ function App() {
                       updateSettingsDebounced({ daily_target_minutes: Number(event.target.value) || 0 })
                     }
                   />
+                  <button
+                    type="button"
+                    className="linkBtn targetAutoBtn"
+                    title="按上下班与午休时长自动计算：下班-上班-午休"
+                    onClick={() => {
+                      const hmToMin = (value: string) => {
+                        const [h, m] = value.split(":").map(Number);
+                        return (h || 0) * 60 + (m || 0);
+                      };
+                      const windowMin = hmToMin(settings.work_end) - hmToMin(settings.work_start);
+                      const lunchMin = Math.max(
+                        0,
+                        hmToMin(settings.lunch_end) - hmToMin(settings.lunch_start)
+                      );
+                      updateSettings({
+                        daily_target_minutes: Math.max(0, windowMin - lunchMin),
+                      });
+                    }}
+                  >
+                    按作息自动设置
+                  </button>
                 </label>
                 <label>
                   <span>数据保留期（天）</span>
@@ -2281,6 +2508,77 @@ function App() {
             <section className="panel">
               <div className="panelTitle">
                 <div>
+                  <h2>通知与周报</h2>
+                  <p>选择哪些提醒会弹出，并可设置免打扰时段与周报推送</p>
+                </div>
+              </div>
+              <div className="notifyToggles">
+                <label className="switchRow">
+                  <input
+                    type="checkbox"
+                    checked={settings.notify_away}
+                    onChange={(event) => updateSettings({ notify_away: event.target.checked })}
+                  />
+                  <span>长时间离开提醒（离开约 30 分钟）</span>
+                </label>
+                <label className="switchRow">
+                  <input
+                    type="checkbox"
+                    checked={settings.notify_daily_summary}
+                    onChange={(event) =>
+                      updateSettings({ notify_daily_summary: event.target.checked })
+                    }
+                  />
+                  <span>日终小结（跨天时汇总昨日活跃与达标情况）</span>
+                </label>
+                <label className="switchRow">
+                  <input
+                    type="checkbox"
+                    checked={settings.notify_pause}
+                    onChange={(event) => updateSettings({ notify_pause: event.target.checked })}
+                  />
+                  <span>暂停提醒（暂停超 30 分钟，防止忘记恢复）</span>
+                </label>
+              </div>
+              <div className="scheduleGrid quietGrid">
+                <label>
+                  <span>免打扰开始</span>
+                  <input
+                    type="time"
+                    value={settings.quiet_start}
+                    onChange={(event) => updateSettings({ quiet_start: event.target.value })}
+                  />
+                </label>
+                <label>
+                  <span>免打扰结束</span>
+                  <input
+                    type="time"
+                    value={settings.quiet_end}
+                    onChange={(event) => updateSettings({ quiet_end: event.target.value })}
+                  />
+                </label>
+              </div>
+              <p className="fieldHint">
+                免打扰时段内所有系统通知静默；开始晚于结束时按跨零点处理（如 22:00–08:00）。
+              </p>
+              <label className="webhookRow">
+                <span>周报机器人 Webhook（企业微信 / 飞书 / 钉钉）</span>
+                <input
+                  type="url"
+                  placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..."
+                  value={settings.report_webhook}
+                  onChange={(event) =>
+                    updateSettingsDebounced({ report_webhook: event.target.value.trim() })
+                  }
+                />
+                <small className="fieldHint">
+                  留空不推送；配置后每周一上午 9 点自动发送最近 7 天的工时小结。
+                </small>
+              </label>
+            </section>
+            <section className="panel">
+              <div className="panelTitle">
+                <div>
                   <h2>隐私说明</h2>
                   <p>本软件只判断“有没有操作”，不采集任何内容</p>
                 </div>
@@ -2322,7 +2620,9 @@ function App() {
                 </div>
                 <div className="aboutRow">
                   <span>快捷键</span>
-                  <strong>⌘R 刷新 · ⌘, 设置 · ⌘1–4 切页 · ⌘/Ctrl+Shift+A 唤出窗口</strong>
+                  <strong>
+                    Ctrl+Space 暂停/恢复 · Ctrl+1–4 切页 · Ctrl+B 补录 · Ctrl+Shift+A 唤出窗口
+                  </strong>
                 </div>
                 {updateInfo && updateInfo.status === "available" && (
                   <div className="updateBox">
@@ -2359,7 +2659,16 @@ function App() {
                   <p className="updateOk">已是最新版本（{updateInfo.current}）</p>
                 )}
                 {updateInfo && updateInfo.status === "error" && (
-                  <p className="updateErr">检查失败：{updateInfo.notes}</p>
+                  <p className="updateErr">
+                    检查失败：
+                    {updateInfo.errorKind === "network"
+                      ? "网络连接异常，请检查网络或代理后重试"
+                      : updateInfo.errorKind === "endpoint"
+                      ? "更新服务暂不可用（未发布新版本或下载地址失效）"
+                      : updateInfo.errorKind === "signature"
+                      ? "更新签名校验失败，已阻止安装，请联系发布者"
+                      : updateInfo.notes}
+                  </p>
                 )}
               </div>
             </section>
@@ -3234,6 +3543,7 @@ function AnalyticsPage({
   exportState,
   exportPath,
   preview,
+  onJumpDate,
 }: {
   records: DailyRecord[];
   settings: Settings;
@@ -3245,6 +3555,7 @@ function AnalyticsPage({
   exportState: "idle" | "exporting" | "done" | "error";
   exportPath: string;
   preview: boolean;
+  onJumpDate: (date: string) => void;
 }) {
   const [range, setRange] = useState(7);
   const [hours, setHours] = useState<HourBucket[]>([]);
@@ -3515,7 +3826,7 @@ function AnalyticsPage({
           </div>
         </div>
         <div className="chartCard">
-          <CalendarHeatmap records={data} settings={settings} />
+          <CalendarHeatmap records={data} settings={settings} onJumpDate={onJumpDate} />
           <div className="calLegend">
             <span>少</span>
             {[0, 1, 2, 3, 4].map((lv) => (
@@ -3634,7 +3945,15 @@ function WeekdayChart({ records }: { records: DailyRecord[] }) {
 const pad2 = (value: number) => String(value).padStart(2, "0");
 
 /** 最近三个月日历热图：格子颜色=当天活跃时长，虚线格=休息日 */
-function CalendarHeatmap({ records, settings }: { records: DailyRecord[]; settings: Settings }) {
+function CalendarHeatmap({
+  records,
+  settings,
+  onJumpDate,
+}: {
+  records: DailyRecord[];
+  settings: Settings;
+  onJumpDate?: (date: string) => void;
+}) {
   const byDate = new Map(records.map((record) => [record.date, record]));
   const today = new Date();
   const max = Math.max(...records.map((record) => record.active_minutes), 60);
@@ -3683,13 +4002,15 @@ function CalendarHeatmap({ records, settings }: { records: DailyRecord[]; settin
                   ? `${(record.active_minutes / 60).toFixed(1)} 小时`
                   : "无记录";
                 return (
-                  <span
+                  <button
                     key={key}
+                    type="button"
                     className={`calCell calL${level}${workday ? "" : " off"}`}
-                    title={`${key} · ${workday ? "工作日" : "休息日"} · ${text}`}
+                    title={`${key} · ${workday ? "工作日" : "休息日"} · ${text}（点击查看当天）`}
+                    onClick={() => onJumpDate?.(key)}
                   >
                     {day}
-                  </span>
+                  </button>
                 );
               })}
             </div>

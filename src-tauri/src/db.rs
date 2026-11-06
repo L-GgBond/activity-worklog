@@ -788,6 +788,33 @@ impl Store {
         })
     }
 
+    /// 列出自动备份目录里的备份文件（名称、字节数、修改时间），供数据健康面板展示。
+    pub fn list_backups(&self) -> Vec<(String, u64, String)> {
+        let dir = self.data_dir.join("backups");
+        let mut files: Vec<(String, u64, std::time::SystemTime)> = match fs::read_dir(&dir) {
+            Ok(entries) => entries
+                .filter_map(|entry| entry.ok())
+                .filter_map(|entry| {
+                    let meta = entry.metadata().ok()?;
+                    if meta.is_file() {
+                        Some((entry.file_name().to_string_lossy().to_string(), meta.len(), meta.modified().ok()?))
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+            Err(_) => return Vec::new(),
+        };
+        files.sort_by(|a, b| b.2.cmp(&a.2));
+        files
+            .into_iter()
+            .map(|(name, size, modified)| {
+                let modified = DateTime::<Local>::from(modified).format("%Y-%m-%d %H:%M").to_string();
+                (name, size, modified)
+            })
+            .collect()
+    }
+
     /// 用 SQLite 的 VACUUM INTO 生成一致性备份（热备份，不阻塞当前连接）。
     pub fn backup_to(&self, dest: &Path) -> anyhow::Result<()> {
         if dest.exists() {

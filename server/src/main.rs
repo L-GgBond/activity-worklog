@@ -57,6 +57,14 @@ struct SegmentPayload {
     segments: Vec<SegmentDto>,
 }
 
+/// 客户端设置（作息、工作日历、通知偏好等），服务端只做存储与看板展示。
+#[derive(Debug, Deserialize)]
+struct SettingsPayload {
+    #[serde(default)]
+    device_id: String,
+    settings: serde_json::Value,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct PulledSegmentDto {
     device_id: String,
@@ -148,6 +156,12 @@ fn open_db() -> anyhow::Result<Connection> {
         );
 
         create index if not exists idx_synced_segments_date on synced_segments(date);
+
+        create table if not exists synced_settings (
+            device_id text primary key,
+            settings_json text not null,
+            updated_at text not null
+        );
         ",
     )?;
     Ok(conn)
@@ -371,6 +385,30 @@ async fn sync_segments(
         accepted += 1;
     }
     Ok(Json(serde_json::json!({ "accepted": accepted })))
+}
+
+/// 接收客户端设置：按设备幂等 upsert，服务端报表可据此使用统一的工作日历口径。
+async fn sync_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<SettingsPayload>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    authorize(&headers, &state.token)?;
+    let conn = state.conn.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let json = serde_json::to_string(&payload.settings)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    conn.execute(
+        "
+        insert into synced_settings (device_id, settings_json, updated_at)
+        values (?1, ?2, ?3)
+        on conflict(device_id) do update set
+            settings_json = excluded.settings_json,
+            updated_at = excluded.updated_at
+        ",
+        params![payload.device_id, json, Local::now().to_rfc3339()],
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 /// 拉取时段明细：换机后设备 ID 会变，所以返回全部设备的行，
@@ -664,6 +702,7 @@ async fn main() {
         .route("/api/health", get(health))
         .route("/api/sync/records", post(sync_records).get(pull_records))
         .route("/api/sync/segments", post(sync_segments).get(pull_segments))
+        .route("/api/sync/settings", post(sync_settings))
         .route("/api/sync/delete", post(delete_records))
         .route("/api/reports/daily", get(daily_report))
         .route("/api/reports/weekly", get(weekly_report))

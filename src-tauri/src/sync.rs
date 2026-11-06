@@ -231,6 +231,38 @@ impl HttpSyncClient {
         Ok(accepted as usize)
     }
 
+    /// 把本机设置（作息、工作日历、通知偏好等）推送到服务端，
+    /// 让服务端报表/Web 看板使用与客户端一致的口径。密码哈希与同步 Token 不发送。
+    pub async fn push_settings(
+        &self,
+        settings: &AppSettings,
+    ) -> anyhow::Result<()> {
+        let url = normalize_url(&settings.sync_url);
+        if url.is_empty() {
+            anyhow::bail!("未配置同步服务器地址");
+        }
+        let mut safe = settings.clone();
+        safe.password_hash.clear();
+        safe.recovery_hash.clear();
+        safe.sync_token.clear();
+        let endpoint = format!("{url}/api/sync/settings");
+        let payload = serde_json::json!({
+            "device_id": device_id(),
+            "settings": safe,
+        });
+        let mut request = self.client.post(&endpoint).json(&payload);
+        if !settings.sync_token.is_empty() {
+            request = request.bearer_auth(&settings.sync_token);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("设置同步失败，服务器返回 {status}: {body}");
+        }
+        Ok(())
+    }
+
     /// 拉取时段明细并按日期挑选“当天工作时长最多”的设备，
     /// 避免把两台机器同一天的时段拼到一起造成重复计算。
     pub async fn pull_segments(
