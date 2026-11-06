@@ -251,6 +251,39 @@ impl Store {
         Ok(inserted)
     }
 
+    /// 从服务器补回时段明细：只补本地完全没有时段的日期，
+    /// 与日汇总的“只补缺失”口径一致，绝不覆盖手工编辑过的日子。
+    pub fn import_missing_segments(&self, incoming: &[ActivitySegment]) -> anyhow::Result<usize> {
+        let mut existing_dates: BTreeSet<String> = BTreeSet::new();
+        {
+            let mut stmt = self.conn.prepare("select distinct date from activity_segments")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                existing_dates.insert(row?);
+            }
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let mut inserted = 0usize;
+        for segment in incoming {
+            if existing_dates.contains(&segment.date) {
+                continue;
+            }
+            tx.execute(
+                "insert into activity_segments (date, started_at, ended_at, segment_type)
+                 values (?1, ?2, ?3, ?4)",
+                params![
+                    segment.date,
+                    segment.started_at,
+                    segment.ended_at,
+                    segment.segment_type
+                ],
+            )?;
+            inserted += 1;
+        }
+        tx.commit()?;
+        Ok(inserted)
+    }
+
     /// 写入某天的日统计，返回是否有实际写入：
     /// 数据没变时跳过，避免「已同步的天被无意义的采样周期反复打回待同步」。
     fn upsert_daily_stats(
@@ -578,6 +611,9 @@ impl Store {
         exported_at: String,
         daily_work_records: Vec<DailyRecord>,
         activity_segments: Vec<ActivitySegment>,
+        // 旧文件没有这一项，缺省即可，不影响历史备份的读取
+        #[serde(default)]
+        settings: Option<AppSettings>,
     }
 
     /// 导出全量数据为 JSON 文件（写入下载目录 / Activity Worklog），返回文件路径。
@@ -596,6 +632,7 @@ impl Store {
             exported_at: Local::now().to_rfc3339(),
             daily_work_records: self.list_all_daily_records()?,
             activity_segments: self.list_all_segments()?,
+            settings: Some(self.get_settings()?),
         };
         let text = to_string_pretty(&payload)
             .map_err(|err| format!("序列化 JSON 失败: {err}"))?;
@@ -640,6 +677,11 @@ impl Store {
             )?;
         }
         tx.commit()?;
+        // 备份里带了设置就一并恢复（含同步地址、节假日、作息等），
+        // 密码哈希也在其中，恢复后应用锁状态自然生效。
+        if let Some(settings) = payload.settings {
+            self.save_settings(&settings)?;
+        }
         Ok(payload.daily_work_records.len() as u32)
     }
 
@@ -756,6 +798,39 @@ impl Store {
             params![dest.to_string_lossy().to_string()],
         )?;
         Ok(())
+    }
+
+    /// 自动备份：写入数据目录下的 backups/，只保留最近 keep 份。
+    /// 由后台循环按天调用，用户不需要记得手动点“备份”。
+    pub fn auto_backup(&self, keep: usize) -> anyhow::Result<PathBuf> {
+        let dir = self.data_dir.join("backups");
+        fs::create_dir_all(&dir)?;
+        let dest = dir.join(format!(
+            "auto-backup-{}.sqlite3",
+            Local::now().format("%Y%m%d-%H%M%S")
+        ));
+        self.backup_to(&dest)?;
+
+        let mut files: Vec<PathBuf> = fs::read_dir(&dir)?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension().map(|value| value == "sqlite3").unwrap_or(false)
+                    && path
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .map(|value| value.starts_with("auto-backup-"))
+                        .unwrap_or(false)
+            })
+            .collect();
+        // 文件名带时间戳，按名称倒序即按时间倒序
+        files.sort();
+        if files.len() > keep {
+            for stale in files.iter().take(files.len() - keep) {
+                let _ = fs::remove_file(stale);
+            }
+        }
+        Ok(dest)
     }
 
     /// 用备份文件替换当前数据库：校验 → 归一化快照 → 断开旧句柄 → 清理 WAL → 覆盖 → 重开。

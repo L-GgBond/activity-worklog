@@ -1,4 +1,5 @@
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -41,6 +42,30 @@ struct DeletePayload {
     dates: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct SegmentDto {
+    date: String,
+    started_at: String,
+    ended_at: String,
+    segment_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SegmentPayload {
+    #[serde(default)]
+    device_id: String,
+    segments: Vec<SegmentDto>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PulledSegmentDto {
+    device_id: String,
+    date: String,
+    started_at: String,
+    ended_at: String,
+    segment_type: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct ReportRow {
     period: String,
@@ -61,20 +86,90 @@ fn open_db() -> anyhow::Result<Connection> {
     let dir = data_dir();
     fs::create_dir_all(&dir)?;
     let conn = Connection::open(dir.join("server.sqlite3"))?;
+
+    // 旧表以 date 为单主键，多设备同一天会互相覆盖。检测主键列，
+    // 命中旧结构就把数据搬到 (device_id, date) 复合主键的新表。
+    let pk_columns = table_pk_columns(&conn, "synced_records");
+    if pk_columns.is_empty() {
+        conn.execute_batch(
+            "
+            create table synced_records (
+                device_id text not null default '',
+                date text not null,
+                first_activity_at text,
+                last_activity_at text,
+                active_minutes integer not null default 0,
+                idle_minutes integer not null default 0,
+                received_at text not null,
+                primary key (device_id, date)
+            );
+
+            create index idx_synced_records_date on synced_records(date);
+            ",
+        )?;
+    } else if pk_columns != vec!["device_id".to_string(), "date".to_string()] {
+        conn.execute_batch(
+            "
+            create table synced_records_new (
+                device_id text not null default '',
+                date text not null,
+                first_activity_at text,
+                last_activity_at text,
+                active_minutes integer not null default 0,
+                idle_minutes integer not null default 0,
+                received_at text not null,
+                primary key (device_id, date)
+            );
+
+            insert or ignore into synced_records_new
+                (device_id, date, first_activity_at, last_activity_at, active_minutes, idle_minutes, received_at)
+            select
+                device_id, date, first_activity_at, last_activity_at, active_minutes, idle_minutes, received_at
+            from synced_records;
+
+            drop table synced_records;
+            alter table synced_records_new rename to synced_records;
+            create index idx_synced_records_date on synced_records(date);
+            ",
+        )?;
+    }
+
+    // 时段明细：换机恢复时需要它，否则历史那几天只能看不能改。
     conn.execute_batch(
         "
-        create table if not exists synced_records (
-            date text primary key,
-            first_activity_at text,
-            last_activity_at text,
-            active_minutes integer not null default 0,
-            idle_minutes integer not null default 0,
-            device_id text not null default '',
-            received_at text not null
+        create table if not exists synced_segments (
+            device_id text not null,
+            date text not null,
+            started_at text not null,
+            ended_at text not null,
+            segment_type text not null check(segment_type in ('work', 'away')),
+            received_at text not null,
+            primary key (device_id, date, started_at)
         );
+
+        create index if not exists idx_synced_segments_date on synced_segments(date);
         ",
     )?;
     Ok(conn)
+}
+
+/// 读取某张表主键列的真实名称（按主键内顺序），用来判断是否需要迁移。
+fn table_pk_columns(conn: &Connection, table: &str) -> Vec<String> {
+    let mut stmt = match conn.prepare(&format!("pragma table_info({table})")) {
+        Ok(stmt) => stmt,
+        Err(_) => return Vec::new(),
+    };
+    let mut rows: Vec<(i64, String)> = stmt
+        .query_map([], |row| Ok((row.get::<_, i64>(5)?, row.get::<_, String>(1)?)))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .collect();
+    rows.sort_by_key(|(order, _)| *order);
+    rows.into_iter()
+        .filter(|(order, _)| *order > 0)
+        .map(|(_, name)| name)
+        .collect()
 }
 
 fn load_or_create_token() -> anyhow::Result<String> {
@@ -177,23 +272,22 @@ async fn sync_records(
         conn.execute(
             "
             insert into synced_records
-                (date, first_activity_at, last_activity_at, active_minutes, idle_minutes, device_id, received_at)
+                (device_id, date, first_activity_at, last_activity_at, active_minutes, idle_minutes, received_at)
             values (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-            on conflict(date) do update set
+            on conflict(device_id, date) do update set
                 first_activity_at = excluded.first_activity_at,
                 last_activity_at = excluded.last_activity_at,
                 active_minutes = excluded.active_minutes,
                 idle_minutes = excluded.idle_minutes,
-                device_id = excluded.device_id,
                 received_at = excluded.received_at
             ",
             params![
+                payload.device_id,
                 record.date,
                 record.first_activity_at,
                 record.last_activity_at,
                 record.active_minutes,
                 record.idle_minutes,
-                payload.device_id,
                 received_at
             ],
         )
@@ -216,26 +310,119 @@ async fn delete_records(
         if NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err() {
             continue;
         }
-        conn.execute(
-            "delete from synced_records where date = ?1",
-            params![date],
+        // 只删本设备的行：两台机器同一天各有记录时，不能连别人的一起删掉。
+        let removed = conn.execute(
+            "delete from synced_records where device_id = ?1 and date = ?2",
+            params![payload.device_id, date],
         )
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        deleted.push(date.clone());
+        conn.execute(
+            "delete from synced_segments where device_id = ?1 and date = ?2",
+            params![payload.device_id, date],
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if removed > 0 {
+            deleted.push(date.clone());
+        }
     }
     Ok(Json(serde_json::json!({ "deleted": deleted })))
+}
+
+/// 接收某台设备的时段明细，按 (device_id, date, started_at) 幂等覆盖。
+async fn sync_segments(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<SegmentPayload>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    authorize(&headers, &state.token)?;
+    let conn = state.conn.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let received_at = Local::now().to_rfc3339();
+    let mut accepted = 0usize;
+    for segment in &payload.segments {
+        if NaiveDate::parse_from_str(&segment.date, "%Y-%m-%d").is_err() {
+            continue;
+        }
+        if segment.segment_type != "work" && segment.segment_type != "away" {
+            continue;
+        }
+        if segment.started_at.is_empty() || segment.ended_at.is_empty() {
+            continue;
+        }
+        conn.execute(
+            "
+            insert into synced_segments
+                (device_id, date, started_at, ended_at, segment_type, received_at)
+            values (?1, ?2, ?3, ?4, ?5, ?6)
+            on conflict(device_id, date, started_at) do update set
+                ended_at = excluded.ended_at,
+                segment_type = excluded.segment_type,
+                received_at = excluded.received_at
+            ",
+            params![
+                payload.device_id,
+                segment.date,
+                segment.started_at,
+                segment.ended_at,
+                segment.segment_type,
+                received_at
+            ],
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        accepted += 1;
+    }
+    Ok(Json(serde_json::json!({ "accepted": accepted })))
+}
+
+/// 拉取时段明细：换机后设备 ID 会变，所以返回全部设备的行，
+/// 由客户端按日期挑选“当天工作时长最多”的那台，避免把两台机器的时段拼在一起。
+async fn pull_segments(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<RangeQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    authorize(&headers, &state.token)?;
+    let days = query.days.unwrap_or(365).clamp(1, 3660);
+    let since = date_n_days_ago(days - 1);
+    let conn = state.conn.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut stmt = conn
+        .prepare(
+            "
+            select device_id, date, started_at, ended_at, segment_type
+            from synced_segments
+            where date >= ?1
+            order by date, device_id, started_at
+            ",
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rows = stmt
+        .query_map(params![since], |row| {
+            Ok(PulledSegmentDto {
+                device_id: row.get(0)?,
+                date: row.get(1)?,
+                started_at: row.get(2)?,
+                ended_at: row.get(3)?,
+                segment_type: row.get(4)?,
+            })
+        })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let segments: Vec<PulledSegmentDto> = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({ "segments": segments })))
 }
 
 fn query_rows(
     conn: &Connection,
     where_clause: &str,
-) -> Result<Vec<(String, Option<String>, Option<String>, i64, i64), StatusCode> {
+) -> Result<Vec<(String, Option<String>, Option<String>, i64, i64)>, StatusCode> {
+    // 复合主键后同一天可能有多台设备的行：报表/恢复都按“当天活跃最多的那台”
+    // 取一条，避免把两台机器的时长重复相加。
     let sql = format!(
         "
         select date, first_activity_at, last_activity_at, active_minutes, idle_minutes
         from synced_records
         where {where_clause}
-        order by date desc
+        order by date desc, active_minutes desc
         "
     );
     let mut stmt = conn.prepare(&sql).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -250,7 +437,16 @@ fn query_rows(
             ))
         })
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+
+    let mut chosen: Vec<(String, Option<String>, Option<String>, i64, i64)> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for row in rows {
+        let row = row.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if seen.insert(row.0.clone()) {
+            chosen.push(row);
+        }
+    }
+    Ok(chosen)
 }
 
 fn date_n_days_ago(days: i64) -> String {
@@ -436,7 +632,20 @@ async fn main() {
     let conn = open_db().expect("打开数据库失败");
     let token = load_or_create_token().expect("生成 Token 失败");
 
-    println!("Activity Worklog 报表服务已启动：http://127.0.0.1:8787");
+    // 默认只监听本机，保证开箱即用的安全；需要跨机器同步时，
+    // 用环境变量 WORKBLOG_BIND 指定监听地址（如 0.0.0.0:8787），
+    // 并务必在前面挂带 TLS 的反向代理，本服务不内置 HTTPS。
+    let bind_raw =
+        std::env::var("WORKBLOG_BIND").unwrap_or_else(|_| "127.0.0.1:8787".to_string());
+    let bind: SocketAddr = bind_raw
+        .parse()
+        .unwrap_or_else(|err| panic!("无法解析 WORKBLOG_BIND={bind_raw}: {err}"));
+    if bind.ip().is_unspecified() || !bind.ip().is_loopback() {
+        println!(
+            "警告：服务监听在非回环地址 {bind}，请确认已通过反向代理提供 HTTPS，且网络访问受控。"
+        );
+    }
+    println!("Activity Worklog 报表服务已启动：http://{bind}");
     println!("访问 Token：{token}");
     println!("（Token 保存在 {}，客户端“数据同步”页需填入同一 Token）", data_dir().join("server-token.txt").display());
 
@@ -454,6 +663,7 @@ async fn main() {
         .route("/", get(dashboard))
         .route("/api/health", get(health))
         .route("/api/sync/records", post(sync_records).get(pull_records))
+        .route("/api/sync/segments", post(sync_segments).get(pull_segments))
         .route("/api/sync/delete", post(delete_records))
         .route("/api/reports/daily", get(daily_report))
         .route("/api/reports/weekly", get(weekly_report))
@@ -464,9 +674,9 @@ async fn main() {
             token,
         }));
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:8787")
+    let listener = tokio::net::TcpListener::bind(bind)
         .await
-        .expect("端口 8787 被占用");
+        .unwrap_or_else(|err| panic!("绑定 {bind} 失败：{err}"));
     axum::serve(listener, app).await.expect("服务启动失败");
 }
 

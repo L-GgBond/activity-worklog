@@ -1,4 +1,4 @@
-use crate::db::DailyRecord;
+use crate::db::{ActivitySegment, DailyRecord};
 use crate::settings::AppSettings;
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -25,6 +25,22 @@ struct PulledRecord {
 struct PullResponse {
     #[serde(default)]
     records: Vec<PulledRecord>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RemoteSegment {
+    #[serde(default)]
+    device_id: String,
+    date: String,
+    started_at: String,
+    ended_at: String,
+    segment_type: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SegmentPullResponse {
+    #[serde(default)]
+    segments: Vec<RemoteSegment>,
 }
 
 /// 基于 reqwest 的同步客户端，负责把待同步记录推送到 Web 后台。
@@ -175,6 +191,105 @@ impl HttpSyncClient {
         Ok(deleted)
     }
 
+    /// 上传时段明细：服务端按 (device_id, date, started_at) 幂等覆盖。
+    pub async fn push_segments(
+        &self,
+        settings: &AppSettings,
+        segments: Vec<ActivitySegment>,
+    ) -> anyhow::Result<usize> {
+        if segments.is_empty() {
+            return Ok(0);
+        }
+        let url = normalize_url(&settings.sync_url);
+        if url.is_empty() {
+            anyhow::bail!("未配置同步服务器地址");
+        }
+        let endpoint = format!("{url}/api/sync/segments");
+        let payload = serde_json::json!({
+            "device_id": device_id(),
+            "segments": segments.iter().map(|segment| serde_json::json!({
+                "date": segment.date,
+                "started_at": segment.started_at,
+                "ended_at": segment.ended_at,
+                "segment_type": segment.segment_type,
+            })).collect::<Vec<_>>(),
+        });
+        let mut request = self.client.post(&endpoint).json(&payload);
+        if !settings.sync_token.is_empty() {
+            request = request.bearer_auth(&settings.sync_token);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("时段同步失败，服务器返回 {status}: {body}");
+        }
+        let accepted = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| value.get("accepted").and_then(|item| item.as_u64()))
+            .unwrap_or(0);
+        Ok(accepted as usize)
+    }
+
+    /// 拉取时段明细并按日期挑选“当天工作时长最多”的设备，
+    /// 避免把两台机器同一天的时段拼到一起造成重复计算。
+    pub async fn pull_segments(
+        &self,
+        settings: &AppSettings,
+        days: u32,
+    ) -> anyhow::Result<Vec<ActivitySegment>> {
+        let url = normalize_url(&settings.sync_url);
+        if url.is_empty() {
+            anyhow::bail!("未配置同步服务器地址");
+        }
+        let days = days.clamp(1, 3660);
+        let endpoint = format!("{url}/api/sync/segments?days={days}");
+        let mut request = self.client.get(&endpoint);
+        if !settings.sync_token.is_empty() {
+            request = request.bearer_auth(&settings.sync_token);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("时段拉取失败，服务器返回 {status}: {body}");
+        }
+        let body: SegmentPullResponse = response.json().await?;
+
+        // 按 (日期, 设备) 分组，先算每组的工作秒数，再选出每天的胜出设备
+        let mut groups: std::collections::BTreeMap<(String, String), Vec<RemoteSegment>> =
+            std::collections::BTreeMap::new();
+        for segment in body.segments {
+            groups
+                .entry((segment.date.clone(), segment.device_id.clone()))
+                .or_default()
+                .push(segment);
+        }
+        let mut by_date: std::collections::BTreeMap<String, (i64, Vec<RemoteSegment>)> =
+            std::collections::BTreeMap::new();
+        for ((date, _device), list) in groups {
+            let work_seconds = list
+                .iter()
+                .filter(|segment| segment.segment_type == "work")
+                .map(|segment| span_seconds(&segment.started_at, &segment.ended_at))
+                .sum::<i64>();
+            let entry = by_date.entry(date).or_insert((-1, Vec::new()));
+            if work_seconds > entry.0 {
+                *entry = (work_seconds, list);
+            }
+        }
+        Ok(by_date
+            .into_values()
+            .flat_map(|(_, list)| list)
+            .map(|segment| ActivitySegment {
+                date: segment.date,
+                started_at: segment.started_at,
+                ended_at: segment.ended_at,
+                segment_type: segment.segment_type,
+            })
+            .collect())
+    }
+
     /// 测试连接：GET /api/health，校验 Token 与服务可达性。
     pub async fn test_connection(&self, settings: &AppSettings) -> anyhow::Result<String> {
         let url = normalize_url(&settings.sync_url);
@@ -206,6 +321,15 @@ fn normalize_url(raw: &str) -> String {
     } else {
         format!("http://{trimmed}")
     }
+}
+
+fn span_seconds(started: &str, ended: &str) -> i64 {
+    let to_seconds = |time: &str| -> i64 {
+        chrono::NaiveTime::parse_from_str(time, "%H:%M:%S")
+            .map(|parsed| parsed.hour() as i64 * 3600 + parsed.minute() as i64 * 60 + parsed.second() as i64)
+            .unwrap_or(0)
+    };
+    (to_seconds(ended) - to_seconds(started)).max(0)
 }
 
 fn device_id() -> String {

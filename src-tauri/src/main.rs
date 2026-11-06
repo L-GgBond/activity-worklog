@@ -671,8 +671,25 @@ async fn pull_from_server(
             .import_missing_records(&records)
             .map_err(|err| err.to_string())?
     };
+
+    // 同时拉取时段明细：只补本地完全没有时段的日期，换机后历史也能继续编辑。
+    let remote_segments = client
+        .pull_segments(&settings, days)
+        .await
+        .unwrap_or_default();
+    let segments_inserted = {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| "store lock failed".to_string())?;
+        store
+            .import_missing_segments(&remote_segments)
+            .unwrap_or(0)
+    };
     let _ = app.emit("records-updated", ());
-    Ok(format!("已从服务器补回 {inserted} 天记录（仅缺失日期）"))
+    Ok(format!(
+        "已从服务器补回 {inserted} 天记录、{segments_inserted} 条时段（仅缺失日期）"
+    ))
 }
 
 /// 把用户输入的恢复码归一化：忽略大小写、横线与空格，统一成 4 位一组
@@ -1250,6 +1267,21 @@ fn spawn_sync_loop(app: AppHandle) {
                         next_sync_at = Some(std::time::Instant::now() + Duration::from_secs(60));
                     } else {
                         // 只标记服务端确认过的日期，避免“假已同步”
+                        let pushed_segments: Vec<ActivitySegment> = {
+                            let state = app.state::<AppState>();
+                            if let Ok(store) = state.store.lock() {
+                                accepted
+                                    .iter()
+                                    .flat_map(|date| store.list_segments_by_date(date).unwrap_or_default())
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            }
+                        };
+                        if !pushed_segments.is_empty() {
+                            // 时段明细失败不影响日汇总的已同步状态，下个周期再试
+                            let _ = client.push_segments(&settings, pushed_segments).await;
+                        }
                         let state = app.state::<AppState>();
                         if let Ok(store) = state.store.lock() {
                             let _ = store.mark_synced(&accepted);
@@ -1262,6 +1294,32 @@ fn spawn_sync_loop(app: AppHandle) {
                     next_sync_at = Some(std::time::Instant::now() + Duration::from_secs(60));
                     let _ = app.emit("sync-error", err.to_string());
                 }
+            }
+        }
+    });
+}
+
+/// 后台自动备份：每 6 小时检查一次，按天产出热备并保留最近 7 份。
+/// 失败只写日志，不打扰用户，也不影响采集与同步。
+fn spawn_backup_loop(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut last_backup_day: Option<chrono::NaiveDate> = None;
+        loop {
+            tokio::time::sleep(Duration::from_secs(6 * 60 * 60)).await;
+            let today = Local::now().date_naive();
+            if last_backup_day == Some(today) {
+                continue;
+            }
+            let state = app.state::<AppState>();
+            match state.store.lock() {
+                Ok(store) => match store.auto_backup(7) {
+                    Ok(path) => {
+                        last_backup_day = Some(today);
+                        eprintln!("[backup] 自动备份已写入 {}", path.display());
+                    }
+                    Err(err) => eprintln!("[backup] 自动备份失败: {err}"),
+                },
+                Err(err) => eprintln!("[backup] store lock failed: {err}"),
             }
         }
     });
@@ -1350,6 +1408,7 @@ fn main() {
             });
             spawn_activity_loop(app.handle().clone());
             spawn_sync_loop(app.handle().clone());
+            spawn_backup_loop(app.handle().clone());
             Ok(())
         })
         .on_window_event(|window, event| {
